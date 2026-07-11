@@ -389,13 +389,6 @@ make vagrant-test
 
 ![Vagrant test results](assets/vagrant-test-results.png)
 
-Both commands enable `MINICAM_ENABLE_WARNINGS_AS_ERRORS=ON`.
-
-Build directories such as `build-runtime-werror/` and `build-linux/` are CMake
-outputs. They can be deleted and regenerated. All `build*/` directories are
-ignored by git and excluded from Vagrant rsync so host CMake caches do not leak
-into the Linux VM.
-
 ### Preview Demo
 
 Capture preview frames from the continuous preview stream and export PNG
