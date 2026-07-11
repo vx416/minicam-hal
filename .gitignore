@@ -1,0 +1,12 @@
+build*/
+artifacts/
+docs/
+notes/
+.vagrant/
+.DS_Store
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.log
