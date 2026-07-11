@@ -1,0 +1,354 @@
+#include "app/buffer_tracker.h"
+#include "app/cli_result_collector.h"
+#include "app/image_writer.h"
+#include "hal/camera_device_session.h"
+#include "hal/camera_hal_runtime.h"
+#include "hal/driver_adapter.h"
+#include "hal/mock_driver_adapter.h"
+#include "hal/v4l2_driver_adapter.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+struct CliOptions {
+  bool use_v4l2 = false;
+  std::string device_path = "/dev/video0";
+  std::optional<std::string> preview_device_path;
+  std::optional<std::string> still_device_path;
+  std::optional<std::string> preview_output_path;
+  size_t preview_frame_count = 0;
+  int width = 640;
+  int height = 480;
+  size_t buffer_count = 4;
+};
+
+std::shared_ptr<minicam::DmaBuf> acquire_output_buffer(
+    minicam::DmaBufPool& pool) {
+  auto buffer = pool.acquire();
+  if (!buffer) {
+    std::cerr << "dma-buf acquire failed: " << pool.last_error() << '\n';
+    return nullptr;
+  }
+  return buffer;
+}
+
+std::unique_ptr<minicam::DriverAdapter> make_driver(
+    const CliOptions& options) {
+  if (!options.use_v4l2) {
+    return std::make_unique<minicam::MockDriverAdapter>();
+  }
+
+  if (options.preview_device_path && options.still_device_path) {
+    return std::make_unique<minicam::V4L2MultiStreamDriverAdapter>(
+        std::vector<minicam::V4L2StreamEndpointConfig>{
+            minicam::V4L2StreamEndpointConfig{
+                .stream_type = minicam::StreamType::Preview,
+                .stream =
+                    minicam::V4L2StreamConfig{
+                        .device_path = *options.preview_device_path,
+                        .width = options.width,
+                        .height = options.height,
+                        .buffer_count = options.buffer_count,
+                    },
+            },
+            minicam::V4L2StreamEndpointConfig{
+                .stream_type = minicam::StreamType::Still,
+                .stream =
+                    minicam::V4L2StreamConfig{
+                        .device_path = *options.still_device_path,
+                        .width = options.width,
+                        .height = options.height,
+                        .buffer_count = options.buffer_count,
+                    },
+            },
+        });
+  }
+
+  const std::string single_device_path =
+      options.still_device_path.value_or(
+          options.preview_device_path.value_or(options.device_path));
+  return std::make_unique<minicam::V4L2DriverAdapter>(
+      minicam::V4L2StreamConfig{
+          .device_path = single_device_path,
+          .width = options.width,
+          .height = options.height,
+          .buffer_count = options.buffer_count,
+      });
+}
+
+CliOptions parse_args(int argc, char** argv) {
+  CliOptions options;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--mock") {
+      options.use_v4l2 = false;
+    } else if (arg == "--v4l2" && i + 1 < argc) {
+      options.use_v4l2 = true;
+      options.device_path = argv[++i];
+    } else if (arg == "--preview-v4l2" && i + 1 < argc) {
+      options.use_v4l2 = true;
+      options.preview_device_path = argv[++i];
+    } else if (arg == "--still-v4l2" && i + 1 < argc) {
+      options.use_v4l2 = true;
+      options.still_device_path = argv[++i];
+    } else if (arg == "--preview-out" && i + 1 < argc) {
+      options.preview_output_path = argv[++i];
+    } else if (arg == "--preview-frames" && i + 1 < argc) {
+      options.preview_frame_count = static_cast<size_t>(std::stoul(argv[++i]));
+    } else if (arg == "--width" && i + 1 < argc) {
+      options.width = std::stoi(argv[++i]);
+    } else if (arg == "--height" && i + 1 < argc) {
+      options.height = std::stoi(argv[++i]);
+    } else if (arg == "--buffers" && i + 1 < argc) {
+      options.buffer_count = static_cast<size_t>(std::stoul(argv[++i]));
+    }
+  }
+  return options;
+}
+
+std::optional<std::string> parse_capture_path(const std::string& line) {
+  std::istringstream input(line);
+  std::string command;
+  input >> command;
+  if (command.empty()) {
+    return std::nullopt;
+  }
+  if (command == "quit" || command == "exit") {
+    return std::string{};
+  }
+  if (command == "capture" || command == "snap") {
+    std::string path;
+    input >> path;
+    if (!path.empty()) {
+      return path;
+    }
+    return std::nullopt;
+  }
+  return command;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  const CliOptions options = parse_args(argc, argv);
+
+  minicam::CameraHalRuntime runtime({
+      .executor =
+          {
+              .shard_count = 2,
+              .shard_queue_capacity = 16,
+          },
+  });
+  if (!runtime.start()) {
+    std::cerr << "failed to start runtime: " << runtime.last_error() << '\n';
+    return EXIT_FAILURE;
+  }
+
+  if (options.use_v4l2) {
+    const size_t buffer_size =
+        static_cast<size_t>(options.width) *
+        static_cast<size_t>(options.height) * 2U;
+    const size_t pool_size =
+        options.preview_device_path ? options.buffer_count + 1
+                                    : options.buffer_count;
+    if (!runtime.dma_buf_pool().initialize(buffer_size, pool_size)) {
+      std::cerr << "failed to initialize dma-buf pool: "
+                << runtime.dma_buf_pool().last_error() << '\n';
+      runtime.stop();
+      return EXIT_FAILURE;
+    }
+  }
+
+  std::vector<minicam::OutputBufferTarget> preview_buffers;
+  minicam::app::BufferTracker preview_buffer_tracker;
+  minicam::app::BufferTracker capture_buffer_tracker;
+  if (options.use_v4l2 && options.preview_device_path) {
+    preview_buffers.reserve(options.buffer_count);
+    for (size_t i = 0; i < options.buffer_count; ++i) {
+      auto buffer = acquire_output_buffer(runtime.dma_buf_pool());
+      if (!buffer) {
+        runtime.stop();
+        return EXIT_FAILURE;
+      }
+      const int buffer_id = static_cast<int>(i);
+      if (!preview_buffer_tracker.register_buffer(buffer_id, buffer)) {
+        buffer->release();
+        runtime.stop();
+        return EXIT_FAILURE;
+      }
+      preview_buffers.push_back(minicam::OutputBufferTarget{
+          .stream_id = 1,
+          .buffer_id = buffer_id,
+          .buffer_fd = buffer->fd(),
+          .buffer_size = buffer->size(),
+          .stream_type = minicam::StreamType::Preview,
+          .width = options.width,
+          .height = options.height,
+          .format = minicam::PixelFormat::Yuyv422,
+      });
+    }
+  }
+
+  minicam::app::CliResultCollector result_collector(
+      minicam::app::CliResultCollectorOptions{
+          .preview_output_path = options.preview_output_path,
+          .preview_frame_count = options.preview_frame_count,
+      },
+      preview_buffer_tracker);
+
+  auto session = std::make_shared<minicam::CameraDeviceSession>(
+      runtime,
+      minicam::CameraDeviceSessionConfig{
+          .session_id = 1,
+          .buffer_count = options.buffer_count,
+          .continuous_preview_config =
+              options.preview_device_path
+                  ? std::optional<minicam::StreamConfig>{
+                        minicam::StreamConfig{
+                            .stream_id = 1,
+                            .stream_type = minicam::StreamType::Preview,
+                            .width = options.width,
+                            .height = options.height,
+                            .format = minicam::PixelFormat::Yuyv422,
+                        }}
+                  : std::nullopt,
+          .continuous_preview_buffers = preview_buffers,
+      },
+      make_driver(options),
+      result_collector.callback());
+
+  if (!session->configure_streams()) {
+    std::cerr << "failed to configure session\n";
+    runtime.stop();
+    return EXIT_FAILURE;
+  }
+  if (!session->start_streaming()) {
+    std::cerr << "failed to start session streaming\n";
+    session->close();
+    runtime.stop();
+    return EXIT_FAILURE;
+  }
+
+  std::cout << "MiniCam HAL CLI\n";
+  std::cout << "commands: capture <path.ppm>, <path.ppm>, quit\n";
+
+  if (options.preview_output_path && options.preview_frame_count > 0) {
+    const bool completed =
+        result_collector.wait_for_preview_frames(std::chrono::seconds(5));
+    if (!completed) {
+      std::cerr << "timed out waiting for preview frames\n";
+      session->close();
+      runtime.stop();
+      return EXIT_FAILURE;
+    }
+    std::cout << "saved " << result_collector.preview_frames_written()
+              << " preview frames to " << *options.preview_output_path << '\n';
+    session->close();
+    preview_buffer_tracker.release_all();
+    runtime.stop();
+    return EXIT_SUCCESS;
+  }
+
+  uint64_t next_frame = 1;
+  std::string line;
+  while (true) {
+    std::cout << "capture path> " << std::flush;
+    if (!std::getline(std::cin, line)) {
+      break;
+    }
+
+    auto parsed = parse_capture_path(line);
+    if (!parsed) {
+      std::cout << "usage: capture <path.ppm>\n";
+      continue;
+    }
+    if (parsed->empty()) {
+      break;
+    }
+
+    const uint64_t frame_number = next_frame++;
+    std::vector<minicam::OutputBufferTarget> outputs;
+    if (options.use_v4l2) {
+      auto buffer = acquire_output_buffer(runtime.dma_buf_pool());
+      if (!buffer) {
+        continue;
+      }
+      const int buffer_id = static_cast<int>(frame_number);
+      if (!capture_buffer_tracker.register_buffer(buffer_id, buffer)) {
+        buffer->release();
+        continue;
+      }
+      outputs = {
+          minicam::OutputBufferTarget{
+              .stream_id =
+                  options.preview_device_path && options.still_device_path
+                      ? 2
+                      : 0,
+              .buffer_id = buffer_id,
+              .buffer_fd = buffer->fd(),
+              .buffer_size = buffer->size(),
+              .stream_type = minicam::StreamType::Still,
+              .width = options.width,
+              .height = options.height,
+              .format = minicam::PixelFormat::Yuyv422,
+          },
+      };
+    }
+
+    if (!session->process_capture_request(minicam::CaptureRequest{
+            .frame_number = frame_number,
+            .width = options.width,
+            .height = options.height,
+            .output_buffers = std::move(outputs),
+        })) {
+      std::cerr << "request rejected by HAL\n";
+      capture_buffer_tracker.release(static_cast<int>(frame_number));
+      continue;
+    }
+
+    auto result =
+        result_collector.wait_for_frame(frame_number, std::chrono::seconds(5));
+    if (!result) {
+      std::cerr << "timed out waiting for frame " << frame_number << '\n';
+      continue;
+    }
+
+    std::shared_ptr<minicam::DmaBuf> output_buffer;
+    if (!result->completed_output_buffers.empty()) {
+      const int buffer_id = result->completed_output_buffers.front().buffer_id;
+      output_buffer = capture_buffer_tracker.take(buffer_id);
+    }
+
+    if (result->status != minicam::CaptureStatus::Ok) {
+      std::cerr << "capture failed: " << result->message << '\n';
+      if (output_buffer) {
+        output_buffer->release();
+      }
+      continue;
+    }
+
+    if (minicam::app::write_ppm(*parsed, *result, output_buffer)) {
+      std::cout << "saved " << *parsed << " (" << result->width << "x"
+                << result->height << ", " << result->latency.count()
+                << " us)\n";
+    }
+    if (output_buffer) {
+      output_buffer->release();
+    }
+  }
+
+  session->close();
+  preview_buffer_tracker.release_all();
+  capture_buffer_tracker.release_all();
+  runtime.stop();
+  return EXIT_SUCCESS;
+}
