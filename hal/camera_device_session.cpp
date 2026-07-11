@@ -403,9 +403,7 @@ void CameraDeviceSession::submit_capture_request(CaptureRequest request) {
     return;
   }
 
-  const bool started =
-      start_in_flight_request_locked(request, std::move(in_flight_outputs));
-  if (!started) {
+  if (!start_in_flight_request_locked(request, std::move(in_flight_outputs))) {
     fill_failed_result_locked(request.frame_number,
                               CaptureStatus::ProcessingError,
                               "duplicate frame number",
