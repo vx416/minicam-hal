@@ -367,8 +367,6 @@ interface/   Public request/result/device contracts
 hal/         Runtime, session, V4L2 adapter, dma-buf pool, task executor
 app/         CLI demo, buffer tracking, result collection, image writing
 tests/       GoogleTest coverage
-docs/        Architecture and lifecycle notes
-notes/       Learning notes and camera stack references
 ```
 
 ## How To Use
@@ -392,7 +390,7 @@ make vagrant-test
 ### Preview Demo
 
 Capture preview frames from the continuous preview stream and export PNG
-artifacts on the host:
+artifacts on a macOS host:
 
 ```sh
 make preview-v4l2-png
@@ -412,7 +410,7 @@ Example V4L2 `vivid` output:
 ### Still Capture Demo
 
 Run preview in the background, submit one still capture request, and export PNG
-artifacts on the host:
+artifacts on a macOS host:
 
 ```sh
 make capture-v4l2-png

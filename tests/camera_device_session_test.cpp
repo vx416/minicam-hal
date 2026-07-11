@@ -314,6 +314,38 @@ TEST_F(CameraDeviceSessionTest, SubmitFailureReturnsErrorAndReleasesBuffer) {
 #endif
 }
 
+TEST_F(CameraDeviceSessionTest, PreflightFailureDoesNotPartiallySubmitRequest) {
+#ifndef __linux__
+  GTEST_SKIP() << "CameraHalRuntime uses epoll";
+#else
+  ASSERT_TRUE(StartStreamingSession(/*buffer_count=*/2));
+  ASSERT_NE(driver, nullptr);
+
+  driver->set_can_submit_capture_outputs(false);
+  EXPECT_TRUE(session->process_capture_request(CaptureRequest{
+      .frame_number = 22,
+      .width = 4,
+      .height = 4,
+      .output_buffers =
+          {
+              OutputBufferTarget{.stream_id = 1, .buffer_id = 201},
+              OutputBufferTarget{.stream_id = 2, .buffer_id = 202},
+          },
+  }));
+
+  auto failed = results.wait_for(22);
+  ASSERT_TRUE(failed.has_value());
+  EXPECT_EQ(failed->status, CaptureStatus::SensorError);
+  EXPECT_EQ(failed->message, "mock driver cannot accept every output");
+  EXPECT_EQ(driver->submit_count(), 0U);
+  ASSERT_EQ(failed->completed_output_buffers.size(), 2U);
+  EXPECT_EQ(failed->completed_output_buffers[0].status,
+            CaptureStatus::ProcessingError);
+  EXPECT_EQ(failed->completed_output_buffers[1].status,
+            CaptureStatus::ProcessingError);
+#endif
+}
+
 TEST_F(CameraDeviceSessionTest, CloseRejectsFutureRequests) {
 #ifndef __linux__
   GTEST_SKIP() << "CameraHalRuntime uses epoll";

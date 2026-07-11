@@ -57,6 +57,12 @@ class DriverAdapter {
   virtual void stop_streaming() = 0;
   virtual void close() = 0;
 
+  // CameraDeviceSession uses this to avoid partially queueing a multi-output
+  // request. A backend should return true only when it can submit every output
+  // in the request without first queueing a subset.
+  virtual bool can_submit_capture_outputs(
+      const std::vector<OutputBufferTarget>& outputs) const = 0;
+
   // Submits one output target from a framework request to the driver. The
   // output_index is the request output vector index used to map completion back
   // to CaptureResult.

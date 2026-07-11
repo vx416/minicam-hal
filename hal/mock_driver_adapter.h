@@ -28,12 +28,15 @@ class MockDriverAdapter final : public DriverAdapter {
   void stop_streaming() override;
   void close() override;
 
+  bool can_submit_capture_outputs(
+      const std::vector<OutputBufferTarget>& outputs) const override;
   bool submit_capture(DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
 
   std::vector<int> event_fds() const override;
   const std::string& last_error() const override;
 
+  void set_can_submit_capture_outputs(bool can_submit);
   void set_fail_submit(bool fail_submit);
   size_t submit_count() const;
 
@@ -48,6 +51,7 @@ class MockDriverAdapter final : public DriverAdapter {
   int write_fd_ = -1;
   bool configured_ = false;
   bool streaming_ = false;
+  bool can_submit_capture_outputs_ = true;
   bool fail_submit_ = false;
   size_t submit_count_ = 0;
 };

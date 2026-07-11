@@ -48,6 +48,8 @@ class V4L2DriverAdapter final : public DriverAdapter {
   void stop_streaming() override;
   void close() override;
 
+  bool can_submit_capture_outputs(
+      const std::vector<OutputBufferTarget>& outputs) const override;
   bool submit_capture(DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
   bool return_stream_buffer(const DriverCompletion& completion) override;
@@ -82,6 +84,7 @@ class V4L2DriverAdapter final : public DriverAdapter {
   void set_error(std::string error);
 
   V4L2QueuedRequest* queued_request_for_index(uint32_t index);
+  size_t free_queued_request_count() const;
   V4L2QueuedRequest* bind_free_queued_request(
       uint64_t frame_number,
       int stream_id,
@@ -131,6 +134,8 @@ class V4L2MultiStreamDriverAdapter final : public DriverAdapter {
   void stop_streaming() override;
   void close() override;
 
+  bool can_submit_capture_outputs(
+      const std::vector<OutputBufferTarget>& outputs) const override;
   bool submit_capture(DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
   bool return_stream_buffer(const DriverCompletion& completion) override;

@@ -364,56 +364,68 @@ bool CameraDeviceSession::reject_request_locked() const {
 
 void CameraDeviceSession::submit_capture_request(CaptureRequest request) {
   CaptureResult result;
-  bool should_dispatch = false;
-
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (reject_request_locked()) {
-      result = make_result(request.frame_number,
-                           CaptureStatus::Flushed,
-                           {},
-                           "session is not accepting requests",
-                           latency_since(request.submitted_at));
-      metrics_.record_failure();
-      should_dispatch = true;
-    } else {
-      const auto outputs = request_outputs_for(request);
-      auto in_flight_outputs = make_in_flight_outputs(outputs);
-      const auto driver_outputs = in_flight_outputs;
-      auto failed_buffers = completed_buffers_for(
-          in_flight_outputs, CaptureStatus::ProcessingError);
-
-      const bool started = start_in_flight_request_locked(
-          request,
-          std::move(in_flight_outputs));
-      bool submitted = false;
-      if (started) {
-        submitted = submit_request_to_driver_locked(
-            request, outputs, driver_outputs);
-      }
-
-      if (!started) {
-        fill_failed_result_locked(request.frame_number,
-                                  CaptureStatus::ProcessingError,
-                                  "duplicate frame number",
-                                  &result,
-                                  std::move(failed_buffers),
-                                  request.submitted_at);
-        should_dispatch = true;
-      } else if (!submitted) {
-        fill_failed_result_locked(request.frame_number,
-                                  CaptureStatus::SensorError,
-                                  driver_ != nullptr
-                                      ? driver_->last_error()
-                                      : "driver is not available",
-                                  &result);
-        should_dispatch = true;
-      }
+  auto dispatch_result = [this, &result] {
+    if (result_callback_) {
+      result_callback_(result);
     }
+  };
+
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (reject_request_locked()) {
+    result = make_result(request.frame_number,
+                         CaptureStatus::Flushed,
+                         {},
+                         "session is not accepting requests",
+                         latency_since(request.submitted_at));
+    metrics_.record_failure();
+    lock.unlock();
+    dispatch_result();
+    return;
   }
 
-  if (should_dispatch && result_callback_) {
-    result_callback_(result);
+  const auto outputs = request_outputs_for(request);
+  auto in_flight_outputs = make_in_flight_outputs(outputs);
+  const auto driver_outputs = in_flight_outputs;
+  auto failed_buffers =
+      completed_buffers_for(in_flight_outputs, CaptureStatus::ProcessingError);
+
+  if (!driver_->can_submit_capture_outputs(outputs)) {
+    fill_failed_result_locked(request.frame_number,
+                              CaptureStatus::SensorError,
+                              driver_->last_error().empty()
+                                  ? "driver cannot accept every output"
+                                  : driver_->last_error(),
+                              &result,
+                              std::move(failed_buffers),
+                              request.submitted_at);
+    lock.unlock();
+    dispatch_result();
+    return;
+  }
+
+  const bool started =
+      start_in_flight_request_locked(request, std::move(in_flight_outputs));
+  if (!started) {
+    fill_failed_result_locked(request.frame_number,
+                              CaptureStatus::ProcessingError,
+                              "duplicate frame number",
+                              &result,
+                              std::move(failed_buffers),
+                              request.submitted_at);
+    lock.unlock();
+    dispatch_result();
+    return;
+  }
+
+  if (!submit_request_to_driver_locked(request, outputs, driver_outputs)) {
+    fill_failed_result_locked(request.frame_number,
+                              CaptureStatus::SensorError,
+                              driver_ != nullptr ? driver_->last_error()
+                                                 : "driver is not available",
+                              &result);
+    lock.unlock();
+    dispatch_result();
+    return;
   }
 }
 

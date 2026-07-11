@@ -117,6 +117,12 @@ void MockDriverAdapter::close() {
   }
 }
 
+bool MockDriverAdapter::can_submit_capture_outputs(
+    const std::vector<OutputBufferTarget>& outputs) const {
+  (void)outputs;
+  return can_submit_capture_outputs_;
+}
+
 bool MockDriverAdapter::submit_capture(DriverOutputBuffer output) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!streaming_) {
@@ -179,6 +185,14 @@ std::vector<int> MockDriverAdapter::event_fds() const {
 
 const std::string& MockDriverAdapter::last_error() const {
   return last_error_;
+}
+
+void MockDriverAdapter::set_can_submit_capture_outputs(bool can_submit) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  can_submit_capture_outputs_ = can_submit;
+  if (!can_submit_capture_outputs_) {
+    set_error("mock driver cannot accept every output");
+  }
 }
 
 void MockDriverAdapter::set_fail_submit(bool fail_submit) {

@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <algorithm>
+#include <unordered_map>
 #include <utility>
 
 namespace minicam {
@@ -230,6 +231,19 @@ bool V4L2DriverAdapter::submit_capture(DriverOutputBuffer output) {
 #endif
 }
 
+bool V4L2DriverAdapter::can_submit_capture_outputs(
+    const std::vector<OutputBufferTarget>& outputs) const {
+  if (!streaming_ || fd_ < 0 || outputs.size() > free_queued_request_count()) {
+    return false;
+  }
+  for (const auto& output : outputs) {
+    if (output.buffer_fd < 0 || output.buffer_size < buffer_size_) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
                                              int stream_id,
                                              int buffer_id,
@@ -385,6 +399,14 @@ V4L2DriverAdapter::queued_request_for_index(uint32_t index) {
   return nullptr;
 }
 
+size_t V4L2DriverAdapter::free_queued_request_count() const {
+  return static_cast<size_t>(std::count_if(
+      queued_requests_.begin(), queued_requests_.end(),
+      [](const V4L2QueuedRequest& queued_request) {
+        return !queued_request.queued;
+      }));
+}
+
 V4L2DriverAdapter::V4L2QueuedRequest*
 V4L2DriverAdapter::bind_free_queued_request(uint64_t frame_number,
                                             int stream_id,
@@ -534,6 +556,26 @@ void V4L2MultiStreamDriverAdapter::close() {
   for (auto& endpoint : endpoints_) {
     endpoint.adapter->close();
   }
+}
+
+bool V4L2MultiStreamDriverAdapter::can_submit_capture_outputs(
+    const std::vector<OutputBufferTarget>& outputs) const {
+  std::unordered_map<const Endpoint*, std::vector<OutputBufferTarget>>
+      outputs_by_endpoint;
+  for (const auto& output : outputs) {
+    const auto* endpoint = endpoint_for(output.stream_type);
+    if (endpoint == nullptr) {
+      return false;
+    }
+    outputs_by_endpoint[endpoint].push_back(output);
+  }
+
+  for (const auto& [endpoint, endpoint_outputs] : outputs_by_endpoint) {
+    if (!endpoint->adapter->can_submit_capture_outputs(endpoint_outputs)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool V4L2MultiStreamDriverAdapter::submit_capture(DriverOutputBuffer output) {
