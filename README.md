@@ -31,7 +31,7 @@ coordination layer.
 
 - [Architecture & Mental Model](#architecture--mental-model)
   - [Camera Stack](#camera-stack)
-  - [HAL Responsibilities](#hal-responsibilities)
+  - [Why A HAL Is Needed](#why-a-hal-is-needed)
   - [Request & Result Lifecycle](#request--result-lifecycle)
 - [Implementation](#implementation)
   - [Runtime](#runtime)
@@ -81,7 +81,7 @@ CLI framework-like client
   -> virtual camera device
 ```
 
-### HAL Responsibilities
+### Why A HAL Is Needed
 
 The HAL is the hardware abstraction layer between the camera framework and the
 driver. Its main job is to talk to the driver, but the driver only exposes
