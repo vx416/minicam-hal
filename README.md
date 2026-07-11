@@ -110,7 +110,7 @@ Camera Framework submits CaptureRequest
   -> Driver fills buffers asynchronously
   -> HAL event loop wakes on driver fd readiness
   -> HAL dequeues completed buffers and restores request context
-  -> HAL returns CaptureResult callback to the framework
+  -> HAL returns CaptureResult to the framework through callback
 ```
 
 MiniCam models HAL with:
@@ -147,7 +147,7 @@ them to the driver, and restores that context when completions arrive.
 7. HAL calls VIDIOC_DQBUF and receives a low-level driver completion
 8. HAL maps the completion back to frame_number/output_index/buffer_id
 9. HAL collects completed outputs for that frame
-10. HAL dispatches CaptureResult(frame_number, completed buffers)
+10. HAL returns CaptureResult(frame_number, completed buffers) through callback
 11. Framework/app reads the completed DMA buffers and can reuse them later
 ```
 
@@ -260,7 +260,7 @@ App owns free output buffer
   -> HAL receives buffer fd in CaptureRequest
   -> V4L2 owns/fills buffer after QBUF
   -> HAL receives DQBUF completion
-  -> HAL emits CaptureResult(buffer_id)
+  -> HAL returns CaptureResult(buffer_id) through callback
   -> App reads mapped buffer and releases it
 ```
 
@@ -305,7 +305,7 @@ HAL owns free dma-buf fd
   -> epoll readiness     fd becomes readable when a buffer completes
   -> VIDIOC_DQBUF        dequeue one completed buffer
   -> HAL restores frame_number/output_index/buffer_id context
-  -> HAL emits CaptureResult
+  -> HAL returns CaptureResult through callback
 ```
 
 Ownership alternates at the queue boundary:
