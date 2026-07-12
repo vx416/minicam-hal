@@ -148,6 +148,17 @@ The request/result lifecycle looks like this from the framework-owned buffer
 handoff to the final release fence returned to the app:
 
 ```text
+Framework/app submits request + output buffer fds + acquire fences
+  -> HAL records frame/output metadata and queues buffers to V4L2
+  -> Driver fills buffers and reports completions asynchronously
+  -> HAL maps completions back to requests and runs output processors
+  -> HAL returns CaptureResult with final release fences
+  -> Framework/app waits release fences, then reads the outputs
+```
+
+Expanded step by step:
+
+```text
 1. Framework/app owns reusable DMA output buffers
 2. Framework builds CaptureRequest(frame_number, output_buffers[]), where each
    output buffer may include an acquire_fence_fd
