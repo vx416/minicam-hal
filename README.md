@@ -144,6 +144,9 @@ does not allocate image memory for every request. Instead, it receives buffer
 file descriptors, records which frame and output each buffer belongs to, queues
 them to the driver, and restores that context when completions arrive.
 
+The request/result lifecycle looks like this from the framework-owned buffer
+handoff to the final release fence returned to the app:
+
 ```text
 1. Framework/app owns reusable DMA output buffers
 2. Framework builds CaptureRequest(frame_number, output_buffers[]), where each
@@ -168,7 +171,9 @@ them to the driver, and restores that context when completions arrive.
 15. Framework/app releases reusable buffers later
 ```
 
-The identifiers form a hierarchy:
+During that lifecycle, different layers use different request metadata fields
+to track ownership, driver I/O, and readiness. The metadata is structured like
+this:
 
 ```text
 frame_number
