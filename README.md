@@ -71,7 +71,8 @@ Responsibilities are split across layers:
   driver completions, and returns results
 - Driver: owns low-level device I/O and talks to the camera device
 
-MiniCam focuses on the HAL layer and the HAL/driver boundary:
+MiniCam uses a simplified architecture shaped like the same stack, with the
+focus on the HAL layer and HAL/driver boundary:
 
 ```text
 CLI framework-like client
