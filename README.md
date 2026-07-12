@@ -31,7 +31,7 @@ coordination layer.
 
 - [Architecture & Mental Model](#architecture--mental-model)
   - [Camera Stack](#camera-stack)
-  - [Why A HAL Is Needed](#why-a-hal-is-needed)
+  - [Why The HAL Layer Is Important](#why-the-hal-layer-is-important)
   - [Request & Result Lifecycle](#request--result-lifecycle)
 - [Implementation](#implementation)
   - [Runtime](#runtime)
@@ -82,12 +82,11 @@ CLI framework-like client
   -> virtual camera device
 ```
 
-### Why A HAL Is Needed
+### Why The HAL Layer Is Important
 
-The HAL is the hardware abstraction layer between the camera framework and the
-driver. Its main job is to talk to the driver, but the driver only exposes
-low-level asynchronous device I/O. That creates several problems the HAL has to
-solve:
+The HAL layer is important because it sits between the camera framework and the
+driver. It talks to the driver, but the driver only exposes low-level
+asynchronous device I/O. That creates several problems the HAL has to solve:
 
 - The driver does not know framework request context. It mainly knows which
   buffer should receive the next frame, not which app request, output target, or
