@@ -376,6 +376,14 @@ HAL owns free dma-buf fd
   -> HAL returns CaptureResult through callback
 ```
 
+Note: this queue/dequeue model is the V4L2 userspace completion contract, not a
+claim that every ISP or camera driver is internally implemented as a simple
+submit queue and completion queue. A real driver may use hardware descriptor
+rings, DMA interrupts, firmware queues, media-controller graphs, request APIs,
+or internal fences. Standard V4L2 capture still exposes buffer completion to
+userspace as `epoll`/`poll` readiness followed by `VIDIOC_DQBUF`, which returns
+ownership of the completed buffer.
+
 Ownership alternates at the queue boundary:
 
 ```text

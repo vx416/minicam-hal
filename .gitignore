@@ -3,6 +3,7 @@ artifacts/
 docs/
 notes/
 .vagrant/
+.vscode/
 .DS_Store
 compile_commands.json
 *.o
