@@ -128,7 +128,7 @@ MiniCam models HAL with:
 - `OutputProcessor`: ordered asynchronous output stages such as JPEG encode
   or postprocessing, with release fd handoff
 - `InFlightRequestTracker`: frame/output bookkeeping while requests are active
-- `TaskExecutor`: per-session serialized async execution
+- `TaskExecutor`: sharded worker pool for ordered per-session async execution
 - `EpollEventLoop`: readiness notifications from V4L2 file descriptors
 
 The most important runtime path starts when the HAL receives a capture request.
@@ -281,7 +281,8 @@ the app/HAL side is still consuming it.
 `CameraHalRuntime` owns process-level resources:
 
 - `EpollEventLoop` watches one or more V4L2 file descriptors
-- `TaskExecutor` runs per-session work in serialized shards
+- `TaskExecutor` uses shard workers backed by bounded MPSC ring queues; tasks
+  with the same session id route to the same worker to preserve ordering.
 - `DmaBufPool` allocates reusable `dma-buf` backed output buffers
 
 This keeps `CameraDeviceSession` focused on camera semantics instead of owning
