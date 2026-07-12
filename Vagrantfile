@@ -35,18 +35,24 @@ Vagrant.configure("2") do |config|
         qemu-system qemu-utils \
         zlib1g-dev libelf-dev libzstd-dev libseccomp-dev \
         linux-headers-$(uname -r) linux-tools-$(uname -r) linux-tools-common \
-        linux-modules-extra-$(uname -r) \
         v4l-utils bsdutils strace ltrace systemtap-sdt-dev protobuf-compiler
+
+      sudo apt-get install -y linux-modules-extra-$(uname -r)
 
       if modinfo vivid >/dev/null 2>&1; then
         sudo modprobe vivid
         sudo usermod -aG video vagrant
+        sudo chgrp video /dev/video* || true
+        sudo chmod 660 /dev/video* || true
+        sudo chgrp video /dev/dma_heap/* || true
+        sudo chmod 660 /dev/dma_heap/* || true
         sudo tee /etc/modules-load.d/minicam-vivid.conf >/dev/null <<'EOF'
 vivid
 EOF
         v4l2-ctl --list-devices || true
       else
-        echo "vivid kernel module is not available for kernel $(uname -r); V4L2 capture tests can use a real USB camera or another kernel with vivid enabled."
+        echo "vivid kernel module is not available for kernel $(uname -r) even after installing linux-modules-extra-$(uname -r)." >&2
+        exit 1
       fi
 
       sudo -u vagrant mkdir -p /home/vagrant/workspace

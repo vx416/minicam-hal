@@ -26,6 +26,7 @@ struct CompletedOutputBuffer {
   int buffer_id = -1;
   int output_index = -1;
   CaptureStatus status = CaptureStatus::Ok;
+  int release_fence_fd = -1;
 };
 
 // App/framework-facing result for one frame.

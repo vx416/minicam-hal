@@ -9,21 +9,21 @@ PREVIEW_V4L2_DEVICE ?= /dev/video0
 STILL_V4L2_DEVICE ?= /dev/video4
 WIDTH ?= 640
 HEIGHT ?= 480
-OUT ?= /tmp/minicam.ppm
+OUT ?= /tmp/minicam.jpg
 PREVIEW_FRAMES ?= 5
 ARTIFACTS_DIR ?= artifacts
-PREVIEW_ARTIFACT_PPM ?= $(ARTIFACTS_DIR)/minicam-preview.ppm
-PREVIEW_ARTIFACT_PNG ?= $(ARTIFACTS_DIR)/minicam-preview.png
-PREVIEW_VM_OUT ?= /tmp/minicam-preview.ppm
-CAPTURE_ARTIFACT_PPM ?= $(ARTIFACTS_DIR)/minicam-capture.ppm
-CAPTURE_ARTIFACT_PNG ?= $(ARTIFACTS_DIR)/minicam-capture.png
-CAPTURE_VM_OUT ?= /tmp/minicam-capture.ppm
+PREVIEW_ARTIFACT_JPG ?= $(ARTIFACTS_DIR)/minicam-preview.jpg
+PREVIEW_VM_OUT ?= /tmp/minicam-preview.jpg
+CAPTURE_ARTIFACT_JPG ?= $(ARTIFACTS_DIR)/minicam-capture.jpg
+CAPTURE_VM_OUT ?= /tmp/minicam-capture.jpg
 
 .PHONY: all configure build test clean \
 	vagrant-rsync vagrant-build vagrant-test \
 	capture-mock capture-v4l2 vagrant-capture-mock vagrant-capture-v4l2 \
 	vagrant-vivid-two-capture vagrant-capture-v4l2-multifd \
-	vagrant-preview-v4l2 preview-v4l2-png capture-v4l2-png \
+	vagrant-preview-v4l2 preview-v4l2-jpg capture-v4l2-jpg \
+	preview-v4l2-png capture-v4l2-png \
+	vagrant-preview-v4l2-jpg vagrant-capture-v4l2-multifd-jpg \
 	vagrant-preview-v4l2-png vagrant-capture-v4l2-multifd-png
 
 all: build
@@ -76,22 +76,26 @@ vagrant-capture-v4l2-multifd: vagrant-build vagrant-vivid-two-capture
 vagrant-preview-v4l2: vagrant-build vagrant-vivid-two-capture
 	vagrant ssh -c 'cd $(VAGRANT_WORKDIR) && ./$(LINUX_BUILD_DIR)/minicam_cli --preview-v4l2 $(PREVIEW_V4L2_DEVICE) --preview-out $(OUT) --preview-frames $(PREVIEW_FRAMES) --width $(WIDTH) --height $(HEIGHT) && file $(OUT)'
 
-preview-v4l2-png:
+preview-v4l2-jpg:
 	$(MAKE) vagrant-preview-v4l2 OUT=$(PREVIEW_VM_OUT) PREVIEW_FRAMES=$(PREVIEW_FRAMES) LINUX_BUILD_DIR=$(LINUX_BUILD_DIR)
 	mkdir -p $(ARTIFACTS_DIR)
-	vagrant ssh -c 'cat $(PREVIEW_VM_OUT)' > $(PREVIEW_ARTIFACT_PPM)
-	sips -s format png $(PREVIEW_ARTIFACT_PPM) --out $(PREVIEW_ARTIFACT_PNG) >/dev/null
-	file $(PREVIEW_ARTIFACT_PPM)
-	file $(PREVIEW_ARTIFACT_PNG)
+	vagrant ssh -c 'cat $(PREVIEW_VM_OUT)' > $(PREVIEW_ARTIFACT_JPG)
+	file $(PREVIEW_ARTIFACT_JPG)
 
-capture-v4l2-png:
+capture-v4l2-jpg:
 	$(MAKE) vagrant-capture-v4l2-multifd OUT=$(CAPTURE_VM_OUT) LINUX_BUILD_DIR=$(LINUX_BUILD_DIR)
 	mkdir -p $(ARTIFACTS_DIR)
-	vagrant ssh -c 'cat $(CAPTURE_VM_OUT)' > $(CAPTURE_ARTIFACT_PPM)
-	sips -s format png $(CAPTURE_ARTIFACT_PPM) --out $(CAPTURE_ARTIFACT_PNG) >/dev/null
-	file $(CAPTURE_ARTIFACT_PPM)
-	file $(CAPTURE_ARTIFACT_PNG)
+	vagrant ssh -c 'cat $(CAPTURE_VM_OUT)' > $(CAPTURE_ARTIFACT_JPG)
+	file $(CAPTURE_ARTIFACT_JPG)
 
-vagrant-preview-v4l2-png: preview-v4l2-png
+preview-v4l2-png: preview-v4l2-jpg
 
-vagrant-capture-v4l2-multifd-png: capture-v4l2-png
+capture-v4l2-png: capture-v4l2-jpg
+
+vagrant-preview-v4l2-jpg: preview-v4l2-jpg
+
+vagrant-capture-v4l2-multifd-jpg: capture-v4l2-jpg
+
+vagrant-preview-v4l2-png: preview-v4l2-jpg
+
+vagrant-capture-v4l2-multifd-png: capture-v4l2-jpg

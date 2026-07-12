@@ -84,6 +84,7 @@ bool MockDriverAdapter::start_continuous_stream(
         .payload_format = FramePayloadFormat::Rgb24,
         .buffer_fd = target.buffer_fd,
         .buffer_size = target.buffer_size,
+        .release_fence_fd = -1,
     });
 
     const uint8_t byte = 1;
@@ -147,6 +148,7 @@ bool MockDriverAdapter::submit_capture(DriverOutputBuffer output) {
       .payload_format = FramePayloadFormat::Rgb24,
       .buffer_fd = output.target.buffer_fd,
       .buffer_size = output.target.buffer_size,
+      .release_fence_fd = -1,
   });
 
   const uint8_t byte = 1;

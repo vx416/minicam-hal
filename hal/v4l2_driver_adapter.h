@@ -67,6 +67,7 @@ class V4L2DriverAdapter final : public DriverAdapter {
     int stream_id = 0;
     int buffer_id = -1;
     int buffer_fd = -1;
+    int acquire_fence_fd = -1;
     size_t buffer_size = 0;
     bool queued = false;
   };
@@ -76,6 +77,7 @@ class V4L2DriverAdapter final : public DriverAdapter {
                             int buffer_id,
                             int output_index,
                             int buffer_fd,
+                            int acquire_fence_fd,
                             size_t buffer_size);
   DriverCompletion convert_queued_request_to_completion(
       const V4L2QueuedRequest& queued_request,
@@ -91,6 +93,7 @@ class V4L2DriverAdapter final : public DriverAdapter {
       int buffer_id,
       int output_index,
       int buffer_fd,
+      int acquire_fence_fd,
       size_t buffer_size);
   void clear_queued_request(uint32_t index);
   void reset_queued_requests();

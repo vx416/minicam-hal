@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace minicam {
 
 namespace {
@@ -64,9 +66,16 @@ std::vector<CompletedOutputBuffer> completed_buffers_for(
         .buffer_id = buffer.target.buffer_id,
         .output_index = buffer.output_index,
         .status = status,
+        .release_fence_fd = buffer.release_fence_fd,
     });
   }
   return completed;
+}
+
+void close_fence_fd(int fence_fd) {
+  if (fence_fd >= 0) {
+    ::close(fence_fd);
+  }
 }
 
 bool is_standalone_stream_completion(const DriverCompletion& completion) {
@@ -85,6 +94,7 @@ CaptureResult capture_result_from_standalone_completion(
                   .buffer_id = completion.buffer_id,
                   .output_index = completion.output_index,
                   .status = CaptureStatus::Ok,
+                  .release_fence_fd = completion.release_fence_fd,
               },
           },
       .message = "preview",
@@ -124,11 +134,13 @@ CameraDeviceSession::CameraDeviceSession(
     CameraHalRuntime& runtime,
     CameraDeviceSessionConfig config,
     std::unique_ptr<DriverAdapter> driver,
-    ResultCallback result_callback)
+    ResultCallback result_callback,
+    std::vector<std::shared_ptr<OutputProcessor>> output_processors)
     : runtime_(runtime),
       config_(config),
       driver_(std::move(driver)),
-      result_callback_(std::move(result_callback)) {}
+      result_callback_(std::move(result_callback)),
+      output_processors_(std::move(output_processors)) {}
 
 CameraDeviceSession::~CameraDeviceSession() {
   close();
@@ -477,19 +489,48 @@ bool CameraDeviceSession::try_fill_result_from_completion_locked(
   CaptureMetadata metadata{
       .sensor_timestamp = completion.timestamp,
   };
+  int release_fence_fd = completion.release_fence_fd;
+  for (const auto& output_processor : output_processors_) {
+    if (output_processor == nullptr) {
+      continue;
+    }
+
+    release_fence_fd =
+        output_processor
+            ->process_output(OutputProcessRequest{
+                .frame_number = completion.frame_number,
+                .output_index = completion.output_index,
+                .stream_id = completion.stream_id,
+                .buffer_id = completion.buffer_id,
+                .buffer_fd = completion.buffer_fd,
+                .buffer_size = completion.buffer_size,
+                .input_acquire_fence_fd = release_fence_fd,
+                .width = completion.width,
+                .height = completion.height,
+                .payload_format = completion.payload_format,
+            })
+            .release_fence_fd;
+  }
+
   if (is_standalone_stream_completion(completion)) {
     metrics_.record_success(std::chrono::microseconds{0});
-    *result = capture_result_from_standalone_completion(completion);
+    auto processed_completion = completion;
+    processed_completion.release_fence_fd = release_fence_fd;
+    *result = capture_result_from_standalone_completion(processed_completion);
     return true;
   }
 
   auto output_completion = in_flight_.complete_output(
-      completion.frame_number, completion.output_index, metadata);
+      completion.frame_number,
+      completion.output_index,
+      release_fence_fd,
+      metadata);
   if (output_completion.state == OutputCompletionState::WaitingForMoreOutputs) {
     return false;
   }
   if (output_completion.state == OutputCompletionState::NotFound ||
       !output_completion.request) {
+    close_fence_fd(release_fence_fd);
     metrics_.record_failure();
     return false;
   }
@@ -497,6 +538,7 @@ bool CameraDeviceSession::try_fill_result_from_completion_locked(
   auto converted_result = capture_result_from_output_completion(
       output_completion, completion);
   if (!converted_result) {
+    close_fence_fd(release_fence_fd);
     metrics_.record_failure();
     return false;
   }

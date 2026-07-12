@@ -4,6 +4,7 @@
 #include "hal/epoll_event_loop.h"
 #include "hal/in_flight_request_tracker.h"
 #include "hal/frame_metrics.h"
+#include "hal/output_processor.h"
 #include "interface/camera_device.h"
 
 #include <chrono>
@@ -71,7 +72,9 @@ class CameraDeviceSession final
   CameraDeviceSession(CameraHalRuntime& runtime,
                       CameraDeviceSessionConfig config,
                       std::unique_ptr<DriverAdapter> driver,
-                      ResultCallback result_callback);
+                      ResultCallback result_callback,
+                      std::vector<std::shared_ptr<OutputProcessor>>
+                          output_processors = {});
   ~CameraDeviceSession();
 
   CameraDeviceSession(const CameraDeviceSession&) = delete;
@@ -140,6 +143,7 @@ class CameraDeviceSession final
   std::vector<int> driver_fds_;
   InFlightRequestTracker in_flight_;
   ResultCallback result_callback_;
+  std::vector<std::shared_ptr<OutputProcessor>> output_processors_;
   FrameMetrics metrics_;
 };
 

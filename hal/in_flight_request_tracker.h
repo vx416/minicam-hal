@@ -35,6 +35,7 @@ struct InFlightOutput {
   OutputBufferTarget target;
   int output_index = -1;
   bool completed = false;
+  int release_fence_fd = -1;
 };
 
 // Accounting row for one active frame. This is the key HAL bookkeeping object:
@@ -82,6 +83,7 @@ class InFlightRequestTracker {
   OutputCompletionResult complete_output(
       uint64_t frame_number,
       int output_index,
+      int release_fence_fd = -1,
       CaptureMetadata metadata = {});
 
   // Fails and removes one frame.

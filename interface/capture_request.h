@@ -33,6 +33,7 @@ struct OutputBufferTarget {
   int stream_id = 0;
   int buffer_id = -1;
   int buffer_fd = -1;
+  int acquire_fence_fd = -1;
   size_t buffer_size = 0;
   StreamType stream_type = StreamType::Still;
   int width = 640;

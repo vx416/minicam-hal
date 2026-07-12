@@ -1,6 +1,6 @@
 #include "app/buffer_tracker.h"
-#include "app/cli_result_collector.h"
-#include "app/image_writer.h"
+#include "app/fence_aware_result_writer.h"
+#include "app/jpeg_encoder_processor.h"
 #include "hal/camera_device_session.h"
 #include "hal/camera_hal_runtime.h"
 #include "hal/driver_adapter.h"
@@ -8,6 +8,7 @@
 #include "hal/v4l2_driver_adapter.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -15,7 +16,10 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -39,6 +43,22 @@ std::shared_ptr<minicam::DmaBuf> acquire_output_buffer(
     return nullptr;
   }
   return buffer;
+}
+
+int make_signaled_acquire_fence() {
+  int fds[2] = {-1, -1};
+  if (::pipe(fds) < 0) {
+    return -1;
+  }
+
+  const uint8_t byte = 1;
+  if (::write(fds[1], &byte, sizeof(byte)) < 0) {
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return -1;
+  }
+  ::close(fds[1]);
+  return fds[0];
 }
 
 std::unique_ptr<minicam::DriverAdapter> make_driver(
@@ -136,6 +156,15 @@ std::optional<std::string> parse_capture_path(const std::string& line) {
   return command;
 }
 
+void close_output_fences(std::vector<minicam::OutputBufferTarget>& outputs) {
+  for (auto& output : outputs) {
+    if (output.acquire_fence_fd >= 0) {
+      ::close(output.acquire_fence_fd);
+      output.acquire_fence_fd = -1;
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -189,6 +218,7 @@ int main(int argc, char** argv) {
           .stream_id = 1,
           .buffer_id = buffer_id,
           .buffer_fd = buffer->fd(),
+          .acquire_fence_fd = make_signaled_acquire_fence(),
           .buffer_size = buffer->size(),
           .stream_type = minicam::StreamType::Preview,
           .width = options.width,
@@ -198,12 +228,53 @@ int main(int argc, char** argv) {
     }
   }
 
-  minicam::app::CliResultCollector result_collector(
-      minicam::app::CliResultCollectorOptions{
-          .preview_output_path = options.preview_output_path,
-          .preview_frame_count = options.preview_frame_count,
-      },
-      preview_buffer_tracker);
+  auto encoded_frames = std::make_shared<minicam::app::EncodedFrameStore>();
+  minicam::app::FenceAwareResultWriter result_writer(
+      preview_buffer_tracker,
+      capture_buffer_tracker,
+      encoded_frames);
+  std::mutex preview_mutex;
+  std::condition_variable preview_ready;
+  size_t preview_frames_written = 0;
+
+  minicam::ResultCallback result_callback =
+      [&](const minicam::CaptureResult& result) {
+        if (result.message == "preview") {
+          if (!options.preview_output_path) {
+            return;
+          }
+
+          {
+            std::lock_guard<std::mutex> lock(preview_mutex);
+            if (preview_frames_written >= options.preview_frame_count) {
+              return;
+            }
+          }
+
+          result_writer.register_path(result.frame_number,
+                                      *options.preview_output_path);
+          result_writer.register_result(result);
+          const auto written_preview =
+              result_writer.block_wait_and_write(result.frame_number,
+                                                 std::chrono::seconds(5));
+          {
+            std::lock_guard<std::mutex> lock(preview_mutex);
+            if (written_preview && written_preview->wrote_image) {
+              ++preview_frames_written;
+            }
+          }
+          preview_ready.notify_all();
+          return;
+        }
+
+        result_writer.register_result(result);
+      };
+
+  auto output_processor =
+      std::make_shared<minicam::app::JpegEncoderProcessor>(
+          preview_buffer_tracker,
+          capture_buffer_tracker,
+          encoded_frames);
 
   auto session = std::make_shared<minicam::CameraDeviceSession>(
       runtime,
@@ -224,7 +295,10 @@ int main(int argc, char** argv) {
           .continuous_preview_buffers = preview_buffers,
       },
       make_driver(options),
-      result_collector.callback());
+      result_callback,
+      std::vector<std::shared_ptr<minicam::OutputProcessor>>{
+          output_processor,
+      });
 
   if (!session->configure_streams()) {
     std::cerr << "failed to configure session\n";
@@ -239,18 +313,24 @@ int main(int argc, char** argv) {
   }
 
   std::cout << "MiniCam HAL CLI\n";
-  std::cout << "commands: capture <path.ppm>, <path.ppm>, quit\n";
+  std::cout << "commands: capture <path.jpg>, <path.jpg>, quit\n";
 
   if (options.preview_output_path && options.preview_frame_count > 0) {
-    const bool completed =
-        result_collector.wait_for_preview_frames(std::chrono::seconds(5));
+    std::unique_lock<std::mutex> lock(preview_mutex);
+    const bool completed = preview_ready.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [&] {
+          return preview_frames_written >= options.preview_frame_count;
+        });
     if (!completed) {
       std::cerr << "timed out waiting for preview frames\n";
       session->close();
       runtime.stop();
       return EXIT_FAILURE;
     }
-    std::cout << "saved " << result_collector.preview_frames_written()
+
+    std::cout << "saved " << preview_frames_written
               << " preview frames to " << *options.preview_output_path << '\n';
     session->close();
     preview_buffer_tracker.release_all();
@@ -268,7 +348,7 @@ int main(int argc, char** argv) {
 
     auto parsed = parse_capture_path(line);
     if (!parsed) {
-      std::cout << "usage: capture <path.ppm>\n";
+      std::cout << "usage: capture <path.jpg>\n";
       continue;
     }
     if (parsed->empty()) {
@@ -295,6 +375,7 @@ int main(int argc, char** argv) {
                       : 0,
               .buffer_id = buffer_id,
               .buffer_fd = buffer->fd(),
+              .acquire_fence_fd = make_signaled_acquire_fence(),
               .buffer_size = buffer->size(),
               .stream_type = minicam::StreamType::Still,
               .width = options.width,
@@ -304,45 +385,42 @@ int main(int argc, char** argv) {
       };
     }
 
+    result_writer.register_path(frame_number, *parsed);
+    auto request_outputs = std::move(outputs);
     if (!session->process_capture_request(minicam::CaptureRequest{
             .frame_number = frame_number,
             .width = options.width,
             .height = options.height,
-            .output_buffers = std::move(outputs),
-        })) {
+            .output_buffers = std::move(request_outputs),
+    })) {
       std::cerr << "request rejected by HAL\n";
+      close_output_fences(request_outputs);
+      result_writer.cancel(frame_number);
       capture_buffer_tracker.release(static_cast<int>(frame_number));
       continue;
     }
 
-    auto result =
-        result_collector.wait_for_frame(frame_number, std::chrono::seconds(5));
-    if (!result) {
+    auto written = result_writer.block_wait_and_write(frame_number,
+                                                      std::chrono::seconds(5));
+    if (!written) {
       std::cerr << "timed out waiting for frame " << frame_number << '\n';
       continue;
     }
 
-    std::shared_ptr<minicam::DmaBuf> output_buffer;
-    if (!result->completed_output_buffers.empty()) {
-      const int buffer_id = result->completed_output_buffers.front().buffer_id;
-      output_buffer = capture_buffer_tracker.take(buffer_id);
-    }
+    const auto& capture_result = written->result;
 
-    if (result->status != minicam::CaptureStatus::Ok) {
-      std::cerr << "capture failed: " << result->message << '\n';
-      if (output_buffer) {
-        output_buffer->release();
-      }
+    if (capture_result.status != minicam::CaptureStatus::Ok) {
+      std::cerr << "capture failed: " << capture_result.message << '\n';
       continue;
     }
 
-    if (minicam::app::write_ppm(*parsed, *result, output_buffer)) {
-      std::cout << "saved " << *parsed << " (" << result->width << "x"
-                << result->height << ", " << result->latency.count()
+    if (written->wrote_image) {
+      std::cout << "saved " << *parsed << " (" << capture_result.width << "x"
+                << capture_result.height << ", "
+                << capture_result.latency.count()
                 << " us)\n";
-    }
-    if (output_buffer) {
-      output_buffer->release();
+    } else {
+      std::cerr << "failed to write " << *parsed << '\n';
     }
   }
 

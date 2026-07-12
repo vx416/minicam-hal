@@ -101,15 +101,20 @@ solve:
   readiness, or image processing.
 - Completed buffers are still raw image data for the next stage of the pipeline.
   The HAL has to coordinate where ISP output, JPEG encoding, postprocessing, or
-  vendor-specific modules would run before returning final results.
+  vendor-specific modules run before returning final results. In a real camera
+  stack, those stages are asynchronous: the HAL has to pass acquire fences into
+  stages that consume a buffer, collect release fences from stages that produce
+  a buffer, and chain those fences so the next processor or app only touches
+  memory after the previous stage has completed.
 
 ```text
 Camera Framework submits CaptureRequest
-  -> HAL validates stream targets and records in-flight frame state
+  -> HAL validates stream targets, acquire fences, and in-flight frame state
   -> HAL queues output buffer fds to the driver through V4L2 ioctl calls
   -> Driver fills buffers asynchronously
   -> HAL event loop wakes on driver fd readiness
   -> HAL dequeues completed buffers and restores request context
+  -> HAL runs output processors and chains their async release fds
   -> HAL returns CaptureResult to the framework through callback
 ```
 
@@ -120,6 +125,8 @@ MiniCam models HAL with:
 - `CameraDeviceSession`: per-camera request/result lifecycle and stream
   semantics
 - `DriverAdapter`: backend abstraction for mock and V4L2 drivers
+- `OutputProcessor`: ordered asynchronous output stages such as JPEG encode
+  or postprocessing, with release fd handoff
 - `InFlightRequestTracker`: frame/output bookkeeping while requests are active
 - `TaskExecutor`: per-session serialized async execution
 - `EpollEventLoop`: readiness notifications from V4L2 file descriptors
@@ -139,16 +146,26 @@ them to the driver, and restores that context when completions arrive.
 
 ```text
 1. Framework/app owns reusable DMA output buffers
-2. Framework builds CaptureRequest(frame_number, output_buffers[])
+2. Framework builds CaptureRequest(frame_number, output_buffers[]), where each
+   output buffer may include an acquire_fence_fd
 3. HAL validates the request and records frame_number -> output_index -> buffer_id
-4. HAL queues each buffer fd to V4L2 with VIDIOC_QBUF
-5. Driver owns the queued buffers and fills them asynchronously
-6. epoll wakes when one of the V4L2 fds has a completed buffer
-7. HAL calls VIDIOC_DQBUF and receives a low-level driver completion
-8. HAL maps the completion back to frame_number/output_index/buffer_id
-9. HAL collects completed outputs for that frame
-10. HAL returns CaptureResult(frame_number, completed buffers) through callback
-11. Framework/app reads the completed DMA buffers and can reuse them later
+4. HAL waits each acquire_fence_fd before queueing that buffer to the driver
+5. HAL queues each buffer fd to V4L2 with VIDIOC_QBUF
+6. Driver owns the queued buffers and fills them asynchronously
+7. epoll wakes when one of the V4L2 fds has a completed buffer
+8. HAL calls VIDIOC_DQBUF and receives a low-level driver completion
+9. HAL maps the completion back to frame_number/output_index/buffer_id
+10. HAL schedules ordered output processors for each completed output
+11. Each processor receives the previous stage's release fd as its input
+    acquire fd and immediately returns a new release_fence_fd for its own
+    asynchronous work
+12. HAL collects completed outputs for that frame
+13. HAL returns CaptureResult(frame_number, completed buffers, final output
+    release fences)
+    through callback
+14. Framework/app waits each completed output's final release_fence_fd before
+    reading that output
+15. Framework/app releases reusable buffers later
 ```
 
 The identifiers form a hierarchy:
@@ -157,18 +174,30 @@ The identifiers form a hierarchy:
 frame_number
   Request id assigned by the framework.
   One frame_number represents one CaptureRequest.
+  One request can contain multiple output buffers, such as preview + still.
 
   output_index
-    Index of an output target inside that request.
-    One request can contain multiple output buffers, such as preview + still.
+    Per-output-buffer index inside that request.
+    Each output buffer contains several metadata fields, such as:
 
     buffer_id
-      Stable id of the framework/app-owned buffer from the buffer pool.
-      This is how the framework recognizes which reusable buffer came back.
+      Stable framework/app-visible identity for the reusable buffer slot.
+      This is used for bookkeeping and for returning the right buffer to the
+      app/framework.
 
     buffer_fd
-      The dma-buf file descriptor for that buffer.
-      This is the actual handle passed to V4L2 with VIDIOC_QBUF.
+      Kernel dma-buf file descriptor for the memory behind that buffer slot.
+      This is the handle imported by V4L2 with VIDIOC_QBUF.
+
+    acquire_fence_fd
+      An fd that must signal before the HAL/driver writes to the buffer.
+      MiniCam waits this before QBUF because standard V4L2 capture queues do
+      not carry Android-style acquire fences directly.
+
+    release_fence_fd
+      An fd returned in CompletedOutputBuffer. The app waits this before
+      reading the processor output. MiniCam's processor fences are pollable
+      pipe-backed async fds, not hardware dma_fence/sync_file fds.
 ```
 
 For still capture:
@@ -180,16 +209,21 @@ CaptureRequest(frame #42)
     output_index = 0
     buffer_id = 42
     buffer_fd = 17
+    acquire_fence_fd = 21
   output[1]:
     stream_id = 3
     output_index = 1
     buffer_id = 43
     buffer_fd = 18
+    acquire_fence_fd = 22
         |
         v
 HAL in-flight table:
   frame #42 -> output_index 0 -> buffer_id 42
             -> output_index 1 -> buffer_id 43
+        |
+        v
+wait acquire_fence_fd 21/22
         |
         v
 V4L2 QBUF(fd=17), QBUF(fd=18)
@@ -201,7 +235,13 @@ epoll -> DQBUF
 DriverCompletion(frame #42, output_index 0, buffer_id 42)
         |
         v
-CaptureResult(frame #42, completed buffer_id 42)
+OutputProcessor waits input acquire fd and returns release_fence_fd
+        |
+        v
+HAL repeats for output_index 1, then returns:
+CaptureResult(frame #42,
+              completed buffer_id 42 + release_fence_fd,
+              completed buffer_id 43 + release_fence_fd)
 ```
 
 For preview:
@@ -239,11 +279,23 @@ its own event loop or permanent worker thread.
 - start preview streaming
 - accept framework-style `CaptureRequest` objects
 - track in-flight frame/output mappings
+- run ordered output processors after driver completion
+- chain processor acquire/release fds across the output pipeline
 - dispatch `CaptureResult` callbacks
 - flush and close active requests
 
 Session code treats driver completions as async events. A completion only
 becomes a result after it is mapped back to the original frame and output.
+For each completed output, the session passes the current release fd into the
+next `OutputProcessor` as that processor's input acquire fd. The final
+processor release fd is stored in `CompletedOutputBuffer::release_fence_fd` and
+returned to the app callback.
+
+MiniCam includes a `JpegEncoderProcessor` to model an asynchronous encode stage.
+It encodes JPEG bytes into an in-memory store and signals a pollable fd when that
+encoded payload is ready. The app-side `FenceAwareResultWriter` registers the
+result/path mapping, blocks on the returned fd, and writes the encoded bytes to
+disk.
 
 ### DMA Buffer Ownership
 
@@ -357,8 +409,8 @@ would use the HAL:
 - initialize `CameraHalRuntime`
 - allocate output buffers from the runtime `DmaBufPool`
 - register buffers in app-side `BufferTracker`
-- collect async results through `CliResultCollector`
-- write completed preview/still buffers to PPM/PNG artifacts
+- collect async results through `FenceAwareResultWriter`
+- write completed preview/still buffers to JPEG artifacts
 
 ## Project Layout
 
@@ -389,18 +441,17 @@ make vagrant-test
 
 ### Preview Demo
 
-Capture preview frames from the continuous preview stream and export PNG
+Capture preview frames from the continuous preview stream and export JPEG
 artifacts on a macOS host:
 
 ```sh
-make preview-v4l2-png
+make preview-v4l2-jpg
 ```
 
 Outputs:
 
 ```text
-artifacts/minicam-preview.ppm
-artifacts/minicam-preview.png
+artifacts/minicam-preview.jpg
 ```
 
 Example V4L2 `vivid` output:
@@ -409,18 +460,17 @@ Example V4L2 `vivid` output:
 
 ### Still Capture Demo
 
-Run preview in the background, submit one still capture request, and export PNG
+Run preview in the background, submit one still capture request, and export JPEG
 artifacts on a macOS host:
 
 ```sh
-make capture-v4l2-png
+make capture-v4l2-jpg
 ```
 
 Outputs:
 
 ```text
-artifacts/minicam-capture.ppm
-artifacts/minicam-capture.png
+artifacts/minicam-capture.jpg
 ```
 
 Raw smoke targets are also available:
@@ -437,27 +487,34 @@ MiniCam models:
 - HAL-style request/result lifecycle
 - preview streaming vs still capture coordination
 - async driver fd readiness through `epoll`
+- async fence-like fd coordination between app, HAL, and output processors
 - V4L2 buffer ownership transfer through `QBUF` / `DQBUF`
 - `dma-buf` fd handoff
+- ordered output processor pipeline with release fd propagation
 - multi-stream routing
 - in-flight frame/output bookkeeping
 - callback-driven buffer recycle for preview
 
 ## What Is Simplified
 
-MiniCam intentionally does not implement:
+MiniCam keeps the shape of a camera HAL pipeline while replacing production
+Android and hardware pieces with smaller learning-oriented equivalents:
 
-- Android AIDL/HIDL Camera HAL service interfaces
-- gralloc buffer handles or sync fences
-- real ISP processing
-- AE/AWB/AF state machines
-- lens/sensor control metadata
-- partial results and notify/error callback split
-- CTS/VTS compatibility
-- a real Pixel camera pipeline
-
-The V4L2 device is Linux `vivid`, so images are synthetic test patterns rather
-than real sensor frames.
+- Android AIDL/HIDL service interfaces are represented by direct C++ session
+  calls and callbacks.
+- Gralloc buffer handles are represented by app-owned `dma-buf` fds and stable
+  `buffer_id` values.
+- Android sync fences and hardware `dma_fence` / `sync_file` fds are represented
+  by pollable pipe-backed async fds.
+- ISP, JPEG, and postprocessing hardware are represented by an ordered
+  `OutputProcessor` pipeline and a CMake-fetched `jpge` JPEG encoder processor.
+- AE/AWB/AF, lens controls, and sensor metadata are reduced to minimal frame
+  timing and status metadata.
+- Android partial results and notify/error callback split are collapsed into one
+  final `CaptureResult` callback per frame.
+- CTS/VTS compatibility and a real Pixel camera pipeline are out of scope.
+- The V4L2 device is Linux `vivid`, so images are synthetic test patterns rather
+  than real sensor frames.
 
 ## What A Real Android Camera HAL Does
 

@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MINICAM_ENABLE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(MINICAM_FETCH_GTEST "Fetch GoogleTest when a system package is unavailable" ON)
+option(MINICAM_FETCH_JPGE "Fetch jpge JPEG encoder" ON)
 
 add_library(minicam_hal
   hal/bounded_task_queue.cpp
@@ -32,13 +33,37 @@ target_compile_options(minicam_hal PRIVATE
   $<$<BOOL:${MINICAM_ENABLE_WARNINGS_AS_ERRORS}>:-Werror>
 )
 
+if(MINICAM_FETCH_JPGE)
+  FetchContent_Declare(
+    jpge
+    GIT_REPOSITORY https://github.com/richgel999/jpeg-compressor.git
+    GIT_TAG aeb7d3b463aa8228b87a28013c15ee50a7e6fcf3
+    SOURCE_SUBDIR minicam_no_upstream_cmake
+  )
+  FetchContent_MakeAvailable(jpge)
+  if(APPLE)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/compat)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/compat/malloc.h "#pragma once\n#include <stdlib.h>\n")
+  endif()
+  add_library(jpge STATIC ${jpge_SOURCE_DIR}/jpge.cpp)
+  target_include_directories(jpge
+    PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/compat
+    PUBLIC ${jpge_SOURCE_DIR}
+  )
+endif()
+
+if(NOT TARGET jpge)
+  message(FATAL_ERROR "jpge target is required. Configure with MINICAM_FETCH_JPGE=ON.")
+endif()
+
 add_executable(minicam_cli
   app/buffer_tracker.cpp
-  app/cli_result_collector.cpp
-  app/image_writer.cpp
+  app/fence_aware_result_writer.cpp
+  app/jpeg_codec.cpp
+  app/jpeg_encoder_processor.cpp
   app/minicam_cli.cpp
 )
-target_link_libraries(minicam_cli PRIVATE minicam_hal)
+target_link_libraries(minicam_cli PRIVATE minicam_hal jpge)
 target_compile_options(minicam_cli PRIVATE
   -Wall -Wextra -Wpedantic
   $<$<BOOL:${MINICAM_ENABLE_WARNINGS_AS_ERRORS}>:-Werror>

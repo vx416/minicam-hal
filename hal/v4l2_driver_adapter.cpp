@@ -3,6 +3,7 @@
 #ifdef __linux__
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -40,6 +41,34 @@ std::chrono::steady_clock::time_point steady_timestamp_from(
   return now_steady +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
              buffer_system - now_system);
+}
+
+bool wait_for_fence(int fence_fd) {
+  if (fence_fd < 0) {
+    return true;
+  }
+
+  pollfd fence_poll{
+      .fd = fence_fd,
+      .events = POLLIN,
+      .revents = 0,
+  };
+  while (true) {
+    const int rc = ::poll(&fence_poll, 1, -1);
+    if (rc > 0) {
+      return (fence_poll.revents & (POLLIN | POLLERR | POLLHUP)) != 0;
+    }
+    if (rc < 0 && errno == EINTR) {
+      continue;
+    }
+    return false;
+  }
+}
+
+void close_fence(int fence_fd) {
+  if (fence_fd >= 0) {
+    ::close(fence_fd);
+  }
 }
 
 }  // namespace
@@ -128,6 +157,7 @@ bool V4L2DriverAdapter::configure_stream() {
         .stream_id = 0,
         .buffer_id = -1,
         .buffer_fd = -1,
+        .acquire_fence_fd = -1,
         .buffer_size = 0,
         .queued = false,
     });
@@ -172,6 +202,7 @@ bool V4L2DriverAdapter::start_continuous_stream(
                               buffer.buffer_id,
                               /*output_index=*/-1,
                               buffer.target.buffer_fd,
+                              buffer.target.acquire_fence_fd,
                               buffer.target.buffer_size)) {
       continuous_streaming_ = false;
       return false;
@@ -223,6 +254,7 @@ bool V4L2DriverAdapter::submit_capture(DriverOutputBuffer output) {
       output.buffer_id,
       output.output_index,
       output.target.buffer_fd,
+      output.target.acquire_fence_fd,
       output.target.buffer_size);
 #else
   (void)output;
@@ -249,6 +281,7 @@ bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
                                              int buffer_id,
                                              int output_index,
                                              int buffer_fd,
+                                             int acquire_fence_fd,
                                              size_t dma_buf_size) {
 #ifdef __linux__
   if (!streaming_ || fd_ < 0) {
@@ -263,10 +296,18 @@ bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
     set_error("request dma-buf is smaller than the configured V4L2 frame");
     return false;
   }
+  if (!wait_for_fence(acquire_fence_fd)) {
+    close_fence(acquire_fence_fd);
+    set_error(std::string("acquire fence wait failed: ") +
+              std::strerror(errno));
+    return false;
+  }
+  close_fence(acquire_fence_fd);
+  acquire_fence_fd = -1;
 
   auto* queued_request =
       bind_free_queued_request(frame_number, stream_id, buffer_id, output_index,
-                               buffer_fd, dma_buf_size);
+                               buffer_fd, acquire_fence_fd, dma_buf_size);
   if (queued_request == nullptr) {
     set_error("V4L2 queue is full");
     return false;
@@ -305,6 +346,7 @@ bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
   (void)buffer_id;
   (void)output_index;
   (void)buffer_fd;
+  (void)acquire_fence_fd;
   (void)dma_buf_size;
   set_error("V4L2 is only available on Linux");
   return false;
@@ -366,6 +408,7 @@ bool V4L2DriverAdapter::return_stream_buffer(
                               completion.buffer_id,
                               /*output_index=*/-1,
                               completion.buffer_fd,
+                              /*acquire_fence_fd=*/-1,
                               completion.buffer_size);
 #else
   (void)completion;
@@ -413,6 +456,7 @@ V4L2DriverAdapter::bind_free_queued_request(uint64_t frame_number,
                                             int buffer_id,
                                             int output_index,
                                             int buffer_fd,
+                                            int acquire_fence_fd,
                                             size_t buffer_size) {
   for (auto& queued_request : queued_requests_) {
     if (queued_request.queued) {
@@ -424,6 +468,7 @@ V4L2DriverAdapter::bind_free_queued_request(uint64_t frame_number,
     queued_request.buffer_id = buffer_id;
     queued_request.output_index = output_index;
     queued_request.buffer_fd = buffer_fd;
+    queued_request.acquire_fence_fd = acquire_fence_fd;
     queued_request.buffer_size = buffer_size;
     return &queued_request;
   }
@@ -441,6 +486,7 @@ void V4L2DriverAdapter::clear_queued_request(uint32_t index) {
   queued_request->stream_id = 0;
   queued_request->buffer_id = -1;
   queued_request->buffer_fd = -1;
+  queued_request->acquire_fence_fd = -1;
   queued_request->buffer_size = 0;
 }
 
@@ -452,6 +498,7 @@ void V4L2DriverAdapter::reset_queued_requests() {
     queued_request.stream_id = 0;
     queued_request.buffer_id = -1;
     queued_request.buffer_fd = -1;
+    queued_request.acquire_fence_fd = -1;
     queued_request.buffer_size = 0;
   }
 }
@@ -472,6 +519,7 @@ DriverCompletion V4L2DriverAdapter::convert_queued_request_to_completion(
       .payload_format = FramePayloadFormat::Yuyv422,
       .buffer_fd = queued_request.buffer_fd,
       .buffer_size = queued_request.buffer_size,
+      .release_fence_fd = -1,
   };
 }
 

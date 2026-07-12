@@ -49,6 +49,7 @@ std::optional<InFlightRequest> InFlightRequestTracker::complete(
 OutputCompletionResult InFlightRequestTracker::complete_output(
     uint64_t frame_number,
     int output_index,
+    int release_fence_fd,
     CaptureMetadata metadata) {
   auto it = requests_.find(frame_number);
   if (it == requests_.end()) {
@@ -63,6 +64,7 @@ OutputCompletionResult InFlightRequestTracker::complete_output(
   for (auto& output : it->second.output_buffers) {
     if (output.output_index == output_index) {
       output.completed = true;
+      output.release_fence_fd = release_fence_fd;
       matched = true;
     }
     all_completed = output.completed && all_completed;

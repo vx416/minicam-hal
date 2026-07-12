@@ -28,6 +28,7 @@ struct DriverCompletion {
   FramePayloadFormat payload_format = FramePayloadFormat::None;
   int buffer_fd = -1;
   size_t buffer_size = 0;
+  int release_fence_fd = -1;
 };
 
 struct DriverOutputBuffer {
