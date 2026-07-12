@@ -205,7 +205,7 @@ frame_number
       pipe-backed async fds, not hardware dma_fence/sync_file fds.
 ```
 
-For still capture:
+Example still capture flow:
 
 ```text
 CaptureRequest(frame #42)
@@ -249,7 +249,7 @@ CaptureResult(frame #42,
               completed buffer_id 43 + release_fence_fd)
 ```
 
-For preview:
+Example preview flow:
 
 ```text
 HAL pre-queues preview buffers
