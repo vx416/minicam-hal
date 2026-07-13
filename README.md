@@ -75,9 +75,9 @@ MiniCam uses a simplified architecture shaped like the same stack, with the
 focus on the HAL layer and HAL/driver boundary:
 
 ```text
-CLI framework-like client
-  -> CameraHalRuntime / CameraDeviceSession
-  -> DriverAdapter
+MiniCam CLI app
+  -> framework-like client layer
+  -> HAL (CameraHalRuntime / CameraDeviceSession / DriverAdapter)
   -> V4L2 vivid driver
   -> virtual camera device
 ```
