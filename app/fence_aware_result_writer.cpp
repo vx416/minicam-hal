@@ -118,28 +118,30 @@ std::optional<WriteResult> FenceAwareResultWriter::block_wait_and_write(
   close_release_fence(completed->release_fence_fd);
 
   const bool is_preview = result.message == "preview";
-  auto tracked = is_preview
-                     ? preview_buffers_.resolve_metadata(completed->buffer_id)
-                     : capture_buffers_.take_metadata(completed->buffer_id);
-  if (!tracked && completed->buffer_id == -1) {
-    tracked = TrackedBuffer{
+  std::optional<TrackedBuffer> captured_buffer;
+  std::optional<TrackedBufferMetadata> tracked_metadata;
+  if (is_preview) {
+    tracked_metadata = preview_buffers_.resolve_metadata(completed->buffer_id);
+  } else {
+    captured_buffer = capture_buffers_.take_metadata(completed->buffer_id);
+    if (captured_buffer) {
+      tracked_metadata = captured_buffer->metadata;
+    }
+  }
+  if (!tracked_metadata && completed->buffer_id == -1) {
+    tracked_metadata = TrackedBufferMetadata{
         .buffer_id = completed->buffer_id,
         .buffer_fd = -1,
         .buffer_size = 0,
-        .buffer = nullptr,
     };
   }
 
   const bool wrote_image =
-      result.status == CaptureStatus::Ok && fence_ready && tracked &&
+      result.status == CaptureStatus::Ok && fence_ready && tracked_metadata &&
       !pending.output_path.empty() &&
       write_encoded_frame(pending.output_path,
                           result.frame_number,
                           completed->buffer_id);
-
-  if (!is_preview && tracked && tracked->buffer) {
-    tracked->buffer->release();
-  }
 
   return WriteResult{
       .result = result,

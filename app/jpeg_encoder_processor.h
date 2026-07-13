@@ -59,7 +59,7 @@ class JpegEncoderProcessor final : public OutputProcessor {
  private:
   void add_worker(std::thread worker);
   void join_workers();
-  std::shared_ptr<DmaBuf> resolve_buffer(int buffer_id) const;
+  DmaBuf* resolve_buffer(int buffer_id) const;
 
   const BufferTracker& preview_buffers_;
   const BufferTracker& capture_buffers_;

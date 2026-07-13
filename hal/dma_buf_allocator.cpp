@@ -89,13 +89,6 @@ void* DmaBuf::mapped_data() const {
   return mapped_data_;
 }
 
-void DmaBuf::release() {
-  if (pool_ == nullptr) {
-    return;
-  }
-  pool_->release(shared_from_this());
-}
-
 int DmaBuf::release_fd() {
   unmap();
   size_ = 0;
@@ -113,12 +106,58 @@ void DmaBuf::reset() {
   size_ = 0;
 }
 
-void DmaBuf::set_pool(DmaBufPool* pool) {
-  pool_ = pool;
-}
-
 void DmaBuf::set_acquired(bool acquired) {
   acquired_ = acquired;
+}
+
+DmaBufLease::DmaBufLease(DmaBufPool* pool,
+                         DmaBuf* buffer,
+                         uint64_t generation)
+    : pool_(pool), buffer_(buffer), generation_(generation) {}
+
+DmaBufLease::~DmaBufLease() {
+  reset();
+}
+
+DmaBufLease::DmaBufLease(DmaBufLease&& other) noexcept
+    : pool_(std::exchange(other.pool_, nullptr)),
+      buffer_(std::exchange(other.buffer_, nullptr)),
+      generation_(std::exchange(other.generation_, 0)) {}
+
+DmaBufLease& DmaBufLease::operator=(DmaBufLease&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  reset();
+  pool_ = std::exchange(other.pool_, nullptr);
+  buffer_ = std::exchange(other.buffer_, nullptr);
+  generation_ = std::exchange(other.generation_, 0);
+  return *this;
+}
+
+DmaBufLease::operator bool() const {
+  return buffer_ != nullptr;
+}
+
+DmaBuf* DmaBufLease::get() const {
+  return buffer_;
+}
+
+DmaBuf& DmaBufLease::operator*() const {
+  return *buffer_;
+}
+
+DmaBuf* DmaBufLease::operator->() const {
+  return buffer_;
+}
+
+void DmaBufLease::reset() {
+  if (pool_ != nullptr && buffer_) {
+    pool_->release(buffer_, generation_);
+  }
+  pool_ = nullptr;
+  buffer_ = nullptr;
+  generation_ = 0;
 }
 
 DmaBufPool::DmaBufPool(std::string heap_path)
@@ -143,10 +182,10 @@ bool DmaBufPool::initialize(size_t buffer_size,
 
   for (auto& buffer : buffers_) {
     if (buffer) {
-      buffer->set_pool(nullptr);
       buffer->set_acquired(false);
     }
   }
+  ++generation_;
   buffers_.clear();
   free_buffers_.clear();
   buffer_size_ = buffer_size;
@@ -158,24 +197,23 @@ bool DmaBufPool::initialize(size_t buffer_size,
       free_buffers_.clear();
       return false;
     }
-    auto shared = std::make_shared<DmaBuf>(std::move(*buffer));
-    shared->set_pool(this);
-    buffers_.push_back(shared);
-    free_buffers_.push_back(std::move(shared));
+    auto owned = std::make_unique<DmaBuf>(std::move(*buffer));
+    free_buffers_.push_back(owned.get());
+    buffers_.push_back(std::move(owned));
   }
   return true;
 }
 
-std::shared_ptr<DmaBuf> DmaBufPool::acquire() {
+DmaBufLease DmaBufPool::acquire() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (free_buffers_.empty()) {
     set_error("no free dma-buf available");
-    return nullptr;
+    return {};
   }
-  auto buffer = free_buffers_.front();
+  DmaBuf* buffer = free_buffers_.front();
   free_buffers_.pop_front();
   buffer->set_acquired(true);
-  return buffer;
+  return DmaBufLease(this, buffer, generation_);
 }
 
 std::optional<DmaBuf> DmaBufPool::allocate_locked(size_t size, bool map) {
@@ -212,10 +250,10 @@ void DmaBufPool::close() {
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& buffer : buffers_) {
     if (buffer) {
-      buffer->set_pool(nullptr);
       buffer->set_acquired(false);
     }
   }
+  ++generation_;
   free_buffers_.clear();
   buffers_.clear();
   buffer_size_ = 0;
@@ -246,18 +284,39 @@ size_t DmaBufPool::capacity() const {
   return buffers_.size();
 }
 
-void DmaBufPool::release(std::shared_ptr<DmaBuf> buffer) {
-  if (!buffer) {
+bool DmaBufPool::initialize_for_testing(std::vector<DmaBuf> buffers) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++generation_;
+  buffers_.clear();
+  free_buffers_.clear();
+  buffer_size_ = buffers.empty() ? 0 : buffers.front().size();
+  buffers_.reserve(buffers.size());
+  for (auto& buffer : buffers) {
+    auto owned = std::make_unique<DmaBuf>(std::move(buffer));
+    free_buffers_.push_back(owned.get());
+    buffers_.push_back(std::move(owned));
+  }
+  return true;
+}
+
+void DmaBufPool::release(DmaBuf* buffer, uint64_t generation) {
+  if (buffer == nullptr) {
     return;
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  const auto it = std::find(buffers_.begin(), buffers_.end(), buffer);
-  if (it == buffers_.end() || !buffer->acquired_) {
+  if (generation != generation_) {
+    return;
+  }
+  const bool belongs_to_pool =
+      std::any_of(buffers_.begin(), buffers_.end(), [buffer](const auto& owned) {
+        return owned.get() == buffer;
+      });
+  if (!belongs_to_pool || !buffer->acquired_) {
     return;
   }
   buffer->set_acquired(false);
-  free_buffers_.push_back(std::move(buffer));
+  free_buffers_.push_back(buffer);
 }
 
 bool DmaBufPool::ensure_open_locked() {

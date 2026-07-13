@@ -35,12 +35,10 @@ struct CliOptions {
   size_t buffer_count = 4;
 };
 
-std::shared_ptr<minicam::DmaBuf> acquire_output_buffer(
-    minicam::DmaBufPool& pool) {
+minicam::DmaBufLease acquire_output_buffer(minicam::DmaBufPool& pool) {
   auto buffer = pool.acquire();
   if (!buffer) {
     std::cerr << "dma-buf acquire failed: " << pool.last_error() << '\n';
-    return nullptr;
   }
   return buffer;
 }
@@ -209,17 +207,19 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
       }
       const int buffer_id = static_cast<int>(i);
-      if (!preview_buffer_tracker.register_buffer(buffer_id, buffer)) {
-        buffer->release();
+      const int buffer_fd = buffer->fd();
+      const size_t buffer_size = buffer->size();
+      if (!preview_buffer_tracker.register_buffer(buffer_id,
+                                                  std::move(buffer))) {
         runtime.stop();
         return EXIT_FAILURE;
       }
       preview_buffers.push_back(minicam::OutputBufferTarget{
           .stream_id = 1,
           .buffer_id = buffer_id,
-          .buffer_fd = buffer->fd(),
+          .buffer_fd = buffer_fd,
           .acquire_fence_fd = make_signaled_acquire_fence(),
-          .buffer_size = buffer->size(),
+          .buffer_size = buffer_size,
           .stream_type = minicam::StreamType::Preview,
           .width = options.width,
           .height = options.height,
@@ -363,8 +363,10 @@ int main(int argc, char** argv) {
         continue;
       }
       const int buffer_id = static_cast<int>(frame_number);
-      if (!capture_buffer_tracker.register_buffer(buffer_id, buffer)) {
-        buffer->release();
+      const int buffer_fd = buffer->fd();
+      const size_t buffer_size = buffer->size();
+      if (!capture_buffer_tracker.register_buffer(buffer_id,
+                                                  std::move(buffer))) {
         continue;
       }
       outputs = {
@@ -374,9 +376,9 @@ int main(int argc, char** argv) {
                       ? 2
                       : 0,
               .buffer_id = buffer_id,
-              .buffer_fd = buffer->fd(),
+              .buffer_fd = buffer_fd,
               .acquire_fence_fd = make_signaled_acquire_fence(),
-              .buffer_size = buffer->size(),
+              .buffer_size = buffer_size,
               .stream_type = minicam::StreamType::Still,
               .width = options.width,
               .height = options.height,

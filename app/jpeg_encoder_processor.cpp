@@ -85,7 +85,7 @@ OutputProcessResult JpegEncoderProcessor::process_output(
     return OutputProcessResult{.release_fence_fd = -1};
   }
 
-  const auto output_buffer = resolve_buffer(request.buffer_id);
+  const auto* output_buffer = resolve_buffer(request.buffer_id);
   const int read_fd = fds[0];
   const int write_fd = fds[1];
   add_worker(std::thread([this,
@@ -128,15 +128,11 @@ void JpegEncoderProcessor::add_worker(std::thread worker) {
   workers_.push_back(std::move(worker));
 }
 
-std::shared_ptr<DmaBuf> JpegEncoderProcessor::resolve_buffer(
-    int buffer_id) const {
-  if (auto tracked = capture_buffers_.resolve_metadata(buffer_id)) {
-    return tracked->buffer;
+DmaBuf* JpegEncoderProcessor::resolve_buffer(int buffer_id) const {
+  if (auto* buffer = capture_buffers_.resolve(buffer_id)) {
+    return buffer;
   }
-  if (auto tracked = preview_buffers_.resolve_metadata(buffer_id)) {
-    return tracked->buffer;
-  }
-  return nullptr;
+  return preview_buffers_.resolve(buffer_id);
 }
 
 void JpegEncoderProcessor::join_workers() {

@@ -318,19 +318,20 @@ disk.
 
 The point of DMA buffer ownership is zero-copy image handoff. The framework/app
 allocates `dma-buf` backed output buffers and passes `buffer_id`, `buffer_fd`,
-and `buffer_size` into the request. The HAL passes the fd to the driver instead
-of copying image payload through userspace memory. The V4L2 backend queues those
-fds with `V4L2_MEMORY_DMABUF`.
+and `buffer_size` into the request. The HAL passes `buffer_fd` to the driver
+instead of copying image payload through userspace memory. The V4L2 backend
+queues those fds with `V4L2_MEMORY_DMABUF`.
 
 Ownership moves like this:
 
 ```text
-App owns free output buffer
-  -> HAL receives buffer fd in CaptureRequest
+App holds a DmaBufLease for a pool-owned output buffer
+  -> HAL receives buffer_fd in CaptureRequest
   -> V4L2 owns/fills buffer after QBUF
   -> HAL receives DQBUF completion
   -> HAL returns CaptureResult(buffer_id) through callback
-  -> App reads mapped buffer and releases it
+  -> App reads mapped buffer
+  -> DmaBufLease destructor returns the buffer to DmaBufPool
 ```
 
 This is intentionally closer to real camera systems: large image frames move by
@@ -367,8 +368,8 @@ open("/dev/videoX")
 The runtime path is an in-queue / out-queue loop:
 
 ```text
-HAL owns free dma-buf fd
-  -> VIDIOC_QBUF         enqueue fd into a driver queue slot
+HAL has buffer_fd for the leased dma-buf
+  -> VIDIOC_QBUF         enqueue buffer_fd into a driver queue slot
   -> VIDIOC_STREAMON     start device streaming after buffers are queued
   -> driver / ISP fills queued buffers asynchronously
   -> epoll readiness     fd becomes readable when a buffer completes

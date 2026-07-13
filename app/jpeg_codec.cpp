@@ -68,9 +68,9 @@ std::optional<std::vector<uint8_t>> compress_rgb_to_jpeg(
 
 std::optional<std::vector<uint8_t>> encode_jpeg(
     const CaptureResult& result,
-    const std::shared_ptr<DmaBuf>& output_buffer) {
+    const DmaBuf* output_buffer) {
   std::span<const uint8_t> image_bytes;
-  if (output_buffer && output_buffer->mapped_data() != nullptr) {
+  if (output_buffer != nullptr && output_buffer->mapped_data() != nullptr) {
     image_bytes = std::span<const uint8_t>(
         static_cast<const uint8_t*>(output_buffer->mapped_data()),
         output_buffer->size());
