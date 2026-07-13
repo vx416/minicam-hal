@@ -52,7 +52,7 @@ class V4L2DriverAdapter final : public DriverAdapter {
       const std::vector<OutputBufferTarget>& outputs) const override;
   bool submit_capture(DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
-  bool return_stream_buffer(const DriverCompletion& completion) override;
+  bool return_stream_buffer(StreamBufferLease lease) override;
 
   std::vector<int> event_fds() const override;
   const std::string& last_error() const override;
@@ -141,7 +141,7 @@ class V4L2MultiStreamDriverAdapter final : public DriverAdapter {
       const std::vector<OutputBufferTarget>& outputs) const override;
   bool submit_capture(DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
-  bool return_stream_buffer(const DriverCompletion& completion) override;
+  bool return_stream_buffer(StreamBufferLease lease) override;
 
   std::vector<int> event_fds() const override;
   const std::string& last_error() const override;

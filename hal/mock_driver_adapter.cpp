@@ -177,6 +177,17 @@ std::optional<DriverCompletion> MockDriverAdapter::dequeue_completion(
   return completion;
 }
 
+bool MockDriverAdapter::return_stream_buffer(StreamBufferLease lease) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!streaming_) {
+    set_error("mock driver is not streaming");
+    return false;
+  }
+  ++returned_stream_buffer_count_;
+  last_returned_stream_buffer_ = lease;
+  return true;
+}
+
 std::vector<int> MockDriverAdapter::event_fds() const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (read_fd_ < 0) {
@@ -205,6 +216,17 @@ void MockDriverAdapter::set_fail_submit(bool fail_submit) {
 size_t MockDriverAdapter::submit_count() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return submit_count_;
+}
+
+size_t MockDriverAdapter::returned_stream_buffer_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return returned_stream_buffer_count_;
+}
+
+std::optional<StreamBufferLease>
+MockDriverAdapter::last_returned_stream_buffer() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return last_returned_stream_buffer_;
 }
 
 bool MockDriverAdapter::open_pipe() {

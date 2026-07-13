@@ -1,6 +1,7 @@
 #include "hal/bounded_task_queue.h"
 
 #include <algorithm>
+#include <cassert>
 #include <thread>
 
 namespace minicam {
@@ -33,9 +34,15 @@ bool BoundedTaskQueue::push(RuntimeTask task) {
                                     std::memory_order_acq_rel,
                                     std::memory_order_relaxed)) {
       const size_t slot = static_cast<size_t>(current_tail % capacity_);
-      while (sequences_[slot].load(std::memory_order_acquire) !=
-             current_tail) {
+      uint64_t slot_sequence =
+          sequences_[slot].load(std::memory_order_acquire);
+      assert(slot_sequence == current_tail);
+      // The capacity check plus successful CAS should reserve a reusable slot.
+      // Keep the wait as a defensive guard if that invariant is violated by a
+      // future memory-ordering or consumer-side change.
+      while (slot_sequence != current_tail) {
         std::this_thread::yield();
+        slot_sequence = sequences_[slot].load(std::memory_order_acquire);
       }
 
       ring_[slot] = std::move(task);

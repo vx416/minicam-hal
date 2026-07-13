@@ -105,6 +105,20 @@ CaptureResult capture_result_from_standalone_completion(
   };
 }
 
+StreamBufferLease stream_buffer_lease_from_completion(
+    const DriverCompletion& completion,
+    StreamType stream_type) {
+  return StreamBufferLease{
+      .frame_number = completion.frame_number,
+      .stream_id = completion.stream_id,
+      .stream_type = stream_type,
+      .buffer_id = completion.buffer_id,
+      .buffer_fd = completion.buffer_fd,
+      .buffer_size = completion.buffer_size,
+      .consumer_release_fence_fd = -1,
+  };
+}
+
 std::optional<CaptureResult> capture_result_from_output_completion(
     const OutputCompletionResult& output_completion,
     const DriverCompletion& completion) {
@@ -135,11 +149,13 @@ CameraDeviceSession::CameraDeviceSession(
     CameraDeviceSessionConfig config,
     std::unique_ptr<DriverAdapter> driver,
     ResultCallback result_callback,
-    std::vector<std::shared_ptr<OutputProcessor>> output_processors)
+    std::vector<std::shared_ptr<OutputProcessor>> output_processors,
+    StreamResultCallback stream_result_callback)
     : runtime_(runtime),
       config_(config),
       driver_(std::move(driver)),
       result_callback_(std::move(result_callback)),
+      stream_result_callback_(std::move(stream_result_callback)),
       output_processors_(std::move(output_processors)) {}
 
 CameraDeviceSession::~CameraDeviceSession() {
@@ -267,22 +283,41 @@ void CameraDeviceSession::on_driver_buffer_complete(
     const DriverCompletion& completion) {
   CaptureResult result;
   bool should_dispatch = false;
+  const bool standalone_stream = is_standalone_stream_completion(completion);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     should_dispatch =
         try_fill_result_from_completion_locked(completion, &result);
   }
 
-  if (should_dispatch && result_callback_) {
-    result_callback_(result);
+  if (!should_dispatch) {
+    return;
   }
 
-  if (should_dispatch && is_standalone_stream_completion(completion)) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (driver_ != nullptr && state_ == CameraSessionState::Streaming &&
-        !driver_->return_stream_buffer(completion)) {
-      metrics_.record_failure();
+  if (standalone_stream) {
+    auto stream_lease = stream_buffer_lease_from_completion(
+        completion,
+        config_.continuous_preview_config
+            ? config_.continuous_preview_config->stream_type
+            : StreamType::Preview);
+    if (stream_result_callback_) {
+      stream_lease = stream_result_callback_(result, std::move(stream_lease));
+    } else if (result_callback_) {
+      result_callback_(result);
     }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (driver_ != nullptr && state_ == CameraSessionState::Streaming &&
+          !driver_->return_stream_buffer(std::move(stream_lease))) {
+        metrics_.record_failure();
+      }
+    }
+    return;
+  }
+
+  if (result_callback_) {
+    result_callback_(result);
   }
 }
 

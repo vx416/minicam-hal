@@ -3,6 +3,7 @@
 #include "hal/driver_adapter.h"
 
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ class MockDriverAdapter final : public DriverAdapter {
       const std::vector<OutputBufferTarget>& outputs) const override;
   bool submit_capture(DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
+  bool return_stream_buffer(StreamBufferLease lease) override;
 
   std::vector<int> event_fds() const override;
   const std::string& last_error() const override;
@@ -39,6 +41,8 @@ class MockDriverAdapter final : public DriverAdapter {
   void set_can_submit_capture_outputs(bool can_submit);
   void set_fail_submit(bool fail_submit);
   size_t submit_count() const;
+  size_t returned_stream_buffer_count() const;
+  std::optional<StreamBufferLease> last_returned_stream_buffer() const;
 
  private:
   bool open_pipe();
@@ -54,6 +58,8 @@ class MockDriverAdapter final : public DriverAdapter {
   bool can_submit_capture_outputs_ = true;
   bool fail_submit_ = false;
   size_t submit_count_ = 0;
+  size_t returned_stream_buffer_count_ = 0;
+  std::optional<StreamBufferLease> last_returned_stream_buffer_;
 };
 
 }  // namespace minicam

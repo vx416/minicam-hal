@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 
 namespace minicam {
@@ -63,7 +64,8 @@ class CameraDeviceSessionTest : public ::testing::Test {
   bool StartStreamingSession(
       size_t buffer_count = 2,
       std::optional<StreamConfig> continuous_preview = std::nullopt,
-      std::vector<OutputBufferTarget> continuous_preview_buffers = {}) {
+      std::vector<OutputBufferTarget> continuous_preview_buffers = {},
+      StreamResultCallback stream_result_callback = {}) {
     if (!runtime.start()) {
       return false;
     }
@@ -79,7 +81,9 @@ class CameraDeviceSessionTest : public ::testing::Test {
             .continuous_preview_buffers = std::move(continuous_preview_buffers),
         },
         std::move(mock_driver),
-        results.callback());
+        results.callback(),
+        std::vector<std::shared_ptr<OutputProcessor>>{},
+        std::move(stream_result_callback));
     return session->configure_streams() && session->start_streaming();
   }
 
@@ -254,6 +258,77 @@ TEST_F(CameraDeviceSessionTest, ContinuousPreviewDispatchesWithoutCaptureRequest
   ASSERT_TRUE(still.has_value());
   EXPECT_EQ(still->status, CaptureStatus::Ok);
   EXPECT_EQ(still->message, "ok");
+#endif
+}
+
+TEST_F(CameraDeviceSessionTest, ContinuousPreviewReturnsLeaseToDriver) {
+#ifndef __linux__
+  GTEST_SKIP() << "CameraHalRuntime uses epoll";
+#else
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::optional<CaptureResult> preview_result;
+  std::optional<StreamBufferLease> callback_lease;
+
+  ASSERT_TRUE(StartStreamingSession(
+      /*buffer_count=*/2,
+      StreamConfig{
+          .stream_id = 9,
+          .stream_type = StreamType::Preview,
+          .width = 8,
+          .height = 4,
+          .format = PixelFormat::Rgb24,
+      },
+      {
+          OutputBufferTarget{
+              .stream_id = 9,
+              .buffer_id = 901,
+              .stream_type = StreamType::Preview,
+              .width = 8,
+              .height = 4,
+              .format = PixelFormat::Rgb24,
+          },
+      },
+      [&](const CaptureResult& result, StreamBufferLease lease) {
+        lease.consumer_release_fence_fd = 123;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          preview_result = result;
+          callback_lease = lease;
+        }
+        ready.notify_all();
+        return lease;
+      }));
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(ready.wait_for(lock, std::chrono::seconds(2), [&] {
+      return preview_result.has_value() && callback_lease.has_value();
+    }));
+  }
+
+  ASSERT_TRUE(preview_result.has_value());
+  EXPECT_EQ(preview_result->message, "preview");
+  EXPECT_EQ(preview_result->completed_output_buffers[0].buffer_id, 901);
+  ASSERT_TRUE(callback_lease.has_value());
+  EXPECT_EQ(callback_lease->stream_id, 9);
+  EXPECT_EQ(callback_lease->stream_type, StreamType::Preview);
+  EXPECT_EQ(callback_lease->buffer_id, 901);
+  EXPECT_EQ(callback_lease->consumer_release_fence_fd, 123);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (driver->returned_stream_buffer_count() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+
+  EXPECT_EQ(driver->returned_stream_buffer_count(), 1U);
+  auto returned_lease = driver->last_returned_stream_buffer();
+  ASSERT_TRUE(returned_lease.has_value());
+  EXPECT_EQ(returned_lease->stream_id, 9);
+  EXPECT_EQ(returned_lease->stream_type, StreamType::Preview);
+  EXPECT_EQ(returned_lease->buffer_id, 901);
+  EXPECT_EQ(returned_lease->consumer_release_fence_fd, 123);
 #endif
 }
 

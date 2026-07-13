@@ -397,21 +397,20 @@ std::optional<DriverCompletion> V4L2DriverAdapter::dequeue_completion(
 #endif
 }
 
-bool V4L2DriverAdapter::return_stream_buffer(
-    const DriverCompletion& completion) {
+bool V4L2DriverAdapter::return_stream_buffer(StreamBufferLease lease) {
 #ifdef __linux__
-  if (!continuous_streaming_ || completion.output_index >= 0) {
+  if (!continuous_streaming_) {
     return true;
   }
   return queue_capture_buffer(next_continuous_frame_number_++,
-                              completion.stream_id,
-                              completion.buffer_id,
+                              lease.stream_id,
+                              lease.buffer_id,
                               /*output_index=*/-1,
-                              completion.buffer_fd,
-                              /*acquire_fence_fd=*/-1,
-                              completion.buffer_size);
+                              lease.buffer_fd,
+                              lease.consumer_release_fence_fd,
+                              lease.buffer_size);
 #else
-  (void)completion;
+  (void)lease;
   set_error("V4L2 is only available on Linux");
   return false;
 #endif
@@ -655,18 +654,14 @@ std::optional<DriverCompletion> V4L2MultiStreamDriverAdapter::
 }
 
 bool V4L2MultiStreamDriverAdapter::return_stream_buffer(
-    const DriverCompletion& completion) {
-  if (completion.output_index >= 0) {
-    return true;
-  }
-
-  auto* endpoint = endpoint_for(StreamType::Preview);
+    StreamBufferLease lease) {
+  auto* endpoint = endpoint_for(lease.stream_type);
   if (endpoint == nullptr) {
     set_error("no V4L2 endpoint for continuous stream type");
     return false;
   }
 
-  if (!endpoint->adapter->return_stream_buffer(completion)) {
+  if (!endpoint->adapter->return_stream_buffer(std::move(lease))) {
     set_error(endpoint->adapter->last_error());
     return false;
   }

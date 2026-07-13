@@ -9,12 +9,14 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -43,6 +45,24 @@ minicam::DmaBufLease acquire_output_buffer(minicam::DmaBufPool& pool) {
   return buffer;
 }
 
+void close_fd(int fd) {
+  if (fd >= 0) {
+    ::close(fd);
+  }
+}
+
+void signal_fence(int write_fd) {
+  const uint8_t byte = 1;
+  (void)::write(write_fd, &byte, sizeof(byte));
+  close_fd(write_fd);
+}
+
+void close_result_release_fences(const minicam::CaptureResult& result) {
+  for (const auto& buffer : result.completed_output_buffers) {
+    close_fd(buffer.release_fence_fd);
+  }
+}
+
 int make_signaled_acquire_fence() {
   int fds[2] = {-1, -1};
   if (::pipe(fds) < 0) {
@@ -51,11 +71,11 @@ int make_signaled_acquire_fence() {
 
   const uint8_t byte = 1;
   if (::write(fds[1], &byte, sizeof(byte)) < 0) {
-    ::close(fds[0]);
-    ::close(fds[1]);
+    close_fd(fds[0]);
+    close_fd(fds[1]);
     return -1;
   }
-  ::close(fds[1]);
+  close_fd(fds[1]);
   return fds[0];
 }
 
@@ -166,6 +186,8 @@ void close_output_fences(std::vector<minicam::OutputBufferTarget>& outputs) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::signal(SIGPIPE, SIG_IGN);
+
   const CliOptions options = parse_args(argc, argv);
 
   minicam::CameraHalRuntime runtime({
@@ -236,24 +258,35 @@ int main(int argc, char** argv) {
   std::mutex preview_mutex;
   std::condition_variable preview_ready;
   size_t preview_frames_written = 0;
+  std::mutex preview_workers_mutex;
+  std::vector<std::thread> preview_workers;
 
   minicam::ResultCallback result_callback =
       [&](const minicam::CaptureResult& result) {
-        if (result.message == "preview") {
-          if (!options.preview_output_path) {
-            return;
-          }
+        result_writer.register_result(result);
+      };
 
-          {
-            std::lock_guard<std::mutex> lock(preview_mutex);
-            if (preview_frames_written >= options.preview_frame_count) {
-              return;
-            }
-          }
+  minicam::StreamResultCallback stream_result_callback =
+      [&](const minicam::CaptureResult& result,
+          minicam::StreamBufferLease lease) {
+        if (!options.preview_output_path) {
+          close_result_release_fences(result);
+          return lease;
+        }
 
-          result_writer.register_path(result.frame_number,
-                                      *options.preview_output_path);
-          result_writer.register_result(result);
+        {
+          std::lock_guard<std::mutex> lock(preview_mutex);
+          if (preview_frames_written >= options.preview_frame_count) {
+            close_result_release_fences(result);
+            return lease;
+          }
+        }
+
+        result_writer.register_path(result.frame_number,
+                                    *options.preview_output_path);
+        result_writer.register_result(result);
+        int fds[2] = {-1, -1};
+        if (::pipe(fds) < 0) {
           const auto written_preview =
               result_writer.block_wait_and_write(result.frame_number,
                                                  std::chrono::seconds(5));
@@ -264,11 +297,46 @@ int main(int argc, char** argv) {
             }
           }
           preview_ready.notify_all();
-          return;
+          return lease;
         }
-
-        result_writer.register_result(result);
+        lease.consumer_release_fence_fd = fds[0];
+        std::thread worker([&result_writer,
+                            &preview_mutex,
+                            &preview_ready,
+                            &preview_frames_written,
+                            frame_number = result.frame_number,
+                            write_fd = fds[1]] {
+          const auto written_preview =
+              result_writer.block_wait_and_write(frame_number,
+                                                 std::chrono::seconds(5));
+          {
+            std::lock_guard<std::mutex> lock(preview_mutex);
+            if (written_preview && written_preview->wrote_image) {
+              ++preview_frames_written;
+            }
+          }
+          preview_ready.notify_all();
+          signal_fence(write_fd);
+        });
+        {
+          std::lock_guard<std::mutex> lock(preview_workers_mutex);
+          preview_workers.push_back(std::move(worker));
+        }
+        return lease;
       };
+
+  auto join_preview_workers = [&] {
+    std::vector<std::thread> workers;
+    {
+      std::lock_guard<std::mutex> lock(preview_workers_mutex);
+      workers.swap(preview_workers);
+    }
+    for (auto& worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  };
 
   auto output_processor =
       std::make_shared<minicam::app::JpegEncoderProcessor>(
@@ -298,7 +366,8 @@ int main(int argc, char** argv) {
       result_callback,
       std::vector<std::shared_ptr<minicam::OutputProcessor>>{
           output_processor,
-      });
+      },
+      stream_result_callback);
 
   if (!session->configure_streams()) {
     std::cerr << "failed to configure session\n";
@@ -323,8 +392,10 @@ int main(int argc, char** argv) {
         [&] {
           return preview_frames_written >= options.preview_frame_count;
         });
+    lock.unlock();
     if (!completed) {
       std::cerr << "timed out waiting for preview frames\n";
+      join_preview_workers();
       session->close();
       runtime.stop();
       return EXIT_FAILURE;
@@ -332,6 +403,7 @@ int main(int argc, char** argv) {
 
     std::cout << "saved " << preview_frames_written
               << " preview frames to " << *options.preview_output_path << '\n';
+    join_preview_workers();
     session->close();
     preview_buffer_tracker.release_all();
     runtime.stop();
@@ -426,6 +498,7 @@ int main(int argc, char** argv) {
     }
   }
 
+  join_preview_workers();
   session->close();
   preview_buffer_tracker.release_all();
   capture_buffer_tracker.release_all();

@@ -38,6 +38,16 @@ struct DriverOutputBuffer {
   int output_index = -1;
 };
 
+struct StreamBufferLease {
+  uint64_t frame_number = 0;
+  int stream_id = 0;
+  StreamType stream_type = StreamType::Preview;
+  int buffer_id = -1;
+  int buffer_fd = -1;
+  size_t buffer_size = 0;
+  int consumer_release_fence_fd = -1;
+};
+
 // Generic driver-facing adapter used by CameraDeviceSession. Different capture
 // backends can implement this interface: V4L2 vivid, USB webcam, fake driver,
 // or a future vendor-specific adapter.
@@ -72,10 +82,11 @@ class DriverAdapter {
   // Dequeues one completed driver buffer after ready_fd becomes ready.
   virtual std::optional<DriverCompletion> dequeue_completion(int ready_fd) = 0;
 
-  // Returns a standalone streaming buffer after the result callback has
-  // finished reading it. Request-driven captures do not use this path.
-  virtual bool return_stream_buffer(const DriverCompletion& completion) {
-    (void)completion;
+  // Returns a standalone streaming buffer. Request-driven captures do not use
+  // this path. The driver must not overwrite the buffer until
+  // consumer_release_fence_fd has signaled.
+  virtual bool return_stream_buffer(StreamBufferLease lease) {
+    (void)lease;
     return true;
   }
 

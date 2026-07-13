@@ -8,6 +8,7 @@
 #include "interface/camera_device.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +18,9 @@
 namespace minicam {
 
 class CameraHalRuntime;
+
+using StreamResultCallback =
+    std::function<StreamBufferLease(const CaptureResult&, StreamBufferLease)>;
 
 // Admission policy for framework-facing capture requests. This intentionally
 // excludes caller-runs execution because running a session task on the framework
@@ -74,7 +78,8 @@ class CameraDeviceSession final
                       std::unique_ptr<DriverAdapter> driver,
                       ResultCallback result_callback,
                       std::vector<std::shared_ptr<OutputProcessor>>
-                          output_processors = {});
+                          output_processors = {},
+                      StreamResultCallback stream_result_callback = {});
   ~CameraDeviceSession();
 
   CameraDeviceSession(const CameraDeviceSession&) = delete;
@@ -143,6 +148,7 @@ class CameraDeviceSession final
   std::vector<int> driver_fds_;
   InFlightRequestTracker in_flight_;
   ResultCallback result_callback_;
+  StreamResultCallback stream_result_callback_;
   std::vector<std::shared_ptr<OutputProcessor>> output_processors_;
   FrameMetrics metrics_;
 };
