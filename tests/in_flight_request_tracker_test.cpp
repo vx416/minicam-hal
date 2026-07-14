@@ -95,6 +95,62 @@ TEST(InFlightRequestTrackerTest, CompleteOutputWaitsForEveryOutputBuffer) {
   EXPECT_FALSE(tracker.contains(8));
 }
 
+TEST(InFlightRequestTrackerTest, MapsDriverTokenToRequestOutputContext) {
+  InFlightRequestTracker tracker;
+  ASSERT_TRUE(tracker.start(CaptureRequest{.frame_number = 9,
+                                           .output_buffers = {}},
+                            OutputBuffers({1})));
+
+  EXPECT_TRUE(tracker.bind_driver_output(
+      DriverToken{.value = 42},
+      DriverOutputContext{
+          .frame_number = 9,
+          .output_index = 1,
+      }));
+
+  auto resolved =
+      tracker.take_driver_output_context(DriverToken{.value = 42});
+  ASSERT_TRUE(resolved.has_value());
+  EXPECT_EQ(resolved->frame_number, 9U);
+  EXPECT_EQ(resolved->output_index, 1);
+  EXPECT_EQ(resolved->target.buffer_id, 1);
+  EXPECT_FALSE(resolved->streaming_output.has_value());
+  EXPECT_FALSE(
+      tracker.take_driver_output_context(DriverToken{.value = 42}).has_value());
+}
+
+TEST(InFlightRequestTrackerTest, MapsDriverTokenToStreamingOutput) {
+  InFlightRequestTracker tracker;
+  ASSERT_TRUE(tracker.register_streaming_output(InFlightStreamingOutput{
+      .frame_number = 100,
+      .target =
+          OutputBufferTarget{
+              .stream_id = 4,
+              .buffer_id = 44,
+              .stream_type = StreamType::Preview,
+          },
+      .stream_type = StreamType::Preview,
+  }));
+  ASSERT_TRUE(tracker.bind_driver_output(
+      DriverToken{.value = 77},
+      DriverOutputContext{
+          .frame_number = 100,
+          .output_index = -1,
+      }));
+
+  auto resolved =
+      tracker.take_driver_output_context(DriverToken{.value = 77});
+  ASSERT_TRUE(resolved.has_value());
+  EXPECT_EQ(resolved->frame_number, 100U);
+  EXPECT_EQ(resolved->output_index, -1);
+  EXPECT_EQ(resolved->target.stream_id, 4);
+  EXPECT_EQ(resolved->target.buffer_id, 44);
+  ASSERT_TRUE(resolved->streaming_output.has_value());
+  EXPECT_EQ(resolved->streaming_output->target.buffer_id, 44);
+  EXPECT_FALSE(
+      tracker.take_driver_output_context(DriverToken{.value = 77}).has_value());
+}
+
 TEST(InFlightRequestTrackerTest, FlushAllReturnsAndClearsActiveRequests) {
   InFlightRequestTracker tracker;
   ASSERT_TRUE(tracker.start(CaptureRequest{.frame_number = 1,

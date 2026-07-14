@@ -78,50 +78,56 @@ void close_fence_fd(int fence_fd) {
   }
 }
 
-bool is_standalone_stream_completion(const DriverCompletion& completion) {
-  return completion.output_index < 0;
+FramePayloadFormat payload_format_for(PixelFormat format) {
+  switch (format) {
+    case PixelFormat::Rgb24:
+      return FramePayloadFormat::Rgb24;
+    case PixelFormat::Yuyv422:
+      return FramePayloadFormat::Yuyv422;
+  }
+  return FramePayloadFormat::None;
 }
 
 CaptureResult capture_result_from_standalone_completion(
-    const DriverCompletion& completion) {
+    const InFlightStreamingOutput& output,
+    int release_fence_fd) {
   return CaptureResult{
-      .frame_number = completion.frame_number,
+      .frame_number = output.frame_number,
       .status = CaptureStatus::Ok,
       .completed_output_buffers =
           {
               CompletedOutputBuffer{
-                  .stream_id = completion.stream_id,
-                  .buffer_id = completion.buffer_id,
-                  .output_index = completion.output_index,
+                  .stream_id = output.target.stream_id,
+                  .buffer_id = output.target.buffer_id,
+                  .output_index = -1,
                   .status = CaptureStatus::Ok,
-                  .release_fence_fd = completion.release_fence_fd,
+                  .release_fence_fd = release_fence_fd,
               },
           },
       .message = "preview",
       .latency = std::chrono::microseconds{0},
-      .width = completion.width,
-      .height = completion.height,
-      .payload_format = completion.payload_format,
+      .width = output.target.width,
+      .height = output.target.height,
+      .payload_format = payload_format_for(output.target.format),
   };
 }
 
 StreamBufferLease stream_buffer_lease_from_completion(
-    const DriverCompletion& completion,
-    StreamType stream_type) {
+    const InFlightStreamingOutput& output) {
   return StreamBufferLease{
-      .frame_number = completion.frame_number,
-      .stream_id = completion.stream_id,
-      .stream_type = stream_type,
-      .buffer_id = completion.buffer_id,
-      .buffer_fd = completion.buffer_fd,
-      .buffer_size = completion.buffer_size,
+      .frame_number = output.frame_number,
+      .stream_id = output.target.stream_id,
+      .stream_type = output.stream_type,
+      .buffer_id = output.target.buffer_id,
+      .buffer_fd = output.target.buffer_fd,
+      .buffer_size = output.target.buffer_size,
       .consumer_release_fence_fd = -1,
   };
 }
 
 std::optional<CaptureResult> capture_result_from_output_completion(
     const OutputCompletionResult& output_completion,
-    const DriverCompletion& completion) {
+    const OutputBufferTarget& target) {
   if (output_completion.state != OutputCompletionState::RequestComplete ||
       !output_completion.request) {
     return std::nullopt;
@@ -136,9 +142,9 @@ std::optional<CaptureResult> capture_result_from_output_completion(
           request.output_buffers, CaptureStatus::Ok),
       .message = "ok",
       .latency = latency,
-      .width = completion.width,
-      .height = completion.height,
-      .payload_format = completion.payload_format,
+      .width = target.width,
+      .height = target.height,
+      .payload_format = payload_format_for(target.format),
   };
 }
 
@@ -212,20 +218,39 @@ bool CameraDeviceSession::start_streaming() {
     }
 
     std::vector<DriverOutputBuffer> preview_buffers;
+    std::vector<InFlightStreamingOutput> streaming_outputs;
     preview_buffers.reserve(config_.continuous_preview_buffers.size());
+    streaming_outputs.reserve(config_.continuous_preview_buffers.size());
     for (const auto& output : config_.continuous_preview_buffers) {
+      const uint64_t frame_number = next_streaming_frame_number_++;
       preview_buffers.push_back(DriverOutputBuffer{
-          .frame_number = 0,
-          .buffer_id = output.buffer_id,
           .target = output,
-          .output_index = -1,
+      });
+      streaming_outputs.push_back(InFlightStreamingOutput{
+          .frame_number = frame_number,
+          .target = output,
+          .stream_type = output.stream_type,
       });
     }
 
-    if (!driver_->start_continuous_stream(
-            *config_.continuous_preview_config, std::move(preview_buffers))) {
+    auto submissions = driver_->start_continuous_stream(
+        *config_.continuous_preview_config, std::move(preview_buffers));
+    if (!submissions || submissions->size() != streaming_outputs.size()) {
       state_ = CameraSessionState::Error;
       return false;
+    }
+    for (size_t i = 0; i < submissions->size(); ++i) {
+      const auto& streaming_output = streaming_outputs[i];
+      if (!in_flight_.register_streaming_output(streaming_output) ||
+          !in_flight_.bind_driver_output(
+              (*submissions)[i].token,
+              DriverOutputContext{
+                  .frame_number = streaming_output.frame_number,
+                  .output_index = -1,
+              })) {
+        state_ = CameraSessionState::Error;
+        return false;
+      }
     }
   }
 
@@ -283,33 +308,45 @@ void CameraDeviceSession::on_driver_buffer_complete(
     const DriverCompletion& completion) {
   CaptureResult result;
   bool should_dispatch = false;
-  const bool standalone_stream = is_standalone_stream_completion(completion);
+  std::optional<StreamBufferLease> stream_lease;
+  std::optional<InFlightStreamingOutput> completed_streaming_output;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    should_dispatch =
-        try_fill_result_from_completion_locked(completion, &result);
+    should_dispatch = try_fill_result_from_completion_locked(
+        completion, &result, &stream_lease, &completed_streaming_output);
   }
 
   if (!should_dispatch) {
     return;
   }
 
-  if (standalone_stream) {
-    auto stream_lease = stream_buffer_lease_from_completion(
-        completion,
-        config_.continuous_preview_config
-            ? config_.continuous_preview_config->stream_type
-            : StreamType::Preview);
+  if (stream_lease.has_value() && completed_streaming_output.has_value()) {
     if (stream_result_callback_) {
-      stream_lease = stream_result_callback_(result, std::move(stream_lease));
+      stream_lease =
+          stream_result_callback_(result, std::move(*stream_lease));
     } else if (result_callback_) {
       result_callback_(result);
     }
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (driver_ != nullptr && state_ == CameraSessionState::Streaming &&
-          !driver_->return_stream_buffer(std::move(stream_lease))) {
+      if (driver_ == nullptr || state_ != CameraSessionState::Streaming) {
+        return;
+      }
+      auto submission = driver_->return_stream_buffer(std::move(*stream_lease));
+      if (!submission) {
+        metrics_.record_failure();
+        return;
+      }
+      auto next_output = *completed_streaming_output;
+      next_output.frame_number = next_streaming_frame_number_++;
+      if (!in_flight_.register_streaming_output(next_output) ||
+          !in_flight_.bind_driver_output(
+              submission->token,
+              DriverOutputContext{
+                  .frame_number = next_output.frame_number,
+                  .output_index = -1,
+              })) {
         metrics_.record_failure();
       }
     }
@@ -345,6 +382,7 @@ void CameraDeviceSession::flush() {
                                     "request flushed",
                                     latency_since(request.submitted_at)));
     }
+    in_flight_.clear_streaming_outputs();
 
     state_ = CameraSessionState::Configured;
   }
@@ -381,6 +419,7 @@ void CameraDeviceSession::close() {
                                     "session closed",
                                     latency_since(request.submitted_at)));
     }
+    in_flight_.clear_streaming_outputs();
 
     if (driver_ != nullptr) {
       driver_->close();
@@ -500,31 +539,48 @@ bool CameraDeviceSession::submit_request_to_driver_locked(
     const std::vector<InFlightOutput>& in_flight_outputs) {
   bool submitted_all = true;
   for (size_t i = 0; i < outputs.size(); ++i) {
-    if (!driver_->submit_capture(DriverOutputBuffer{
-            .frame_number = request.frame_number,
-            .buffer_id = outputs[i].buffer_id,
-            .target = outputs[i],
-            .output_index = in_flight_outputs[i].output_index,
-        })) {
+    auto submission = driver_->submit_capture(DriverOutputBuffer{
+        .target = outputs[i],
+    });
+    if (!submission ||
+        !in_flight_.bind_driver_output(
+            submission->token,
+            DriverOutputContext{
+                .frame_number = request.frame_number,
+                .output_index = in_flight_outputs[i].output_index,
+            })) {
       submitted_all = false;
       break;
     }
   }
 
-  return submitted_all && in_flight_.mark_queued_to_driver(request.frame_number);
+  if (!submitted_all) {
+    in_flight_.clear_driver_outputs_for_frame(request.frame_number);
+    return false;
+  }
+  return in_flight_.mark_queued_to_driver(request.frame_number);
 }
 
 bool CameraDeviceSession::try_fill_result_from_completion_locked(
     const DriverCompletion& completion,
-    CaptureResult* result) {
+    CaptureResult* result,
+    std::optional<StreamBufferLease>* stream_lease,
+    std::optional<InFlightStreamingOutput>* completed_streaming_output) {
   if (result == nullptr) {
     return false;
   }
 
+  auto resolved = in_flight_.take_driver_output_context(completion.token);
+  if (!resolved) {
+    metrics_.record_failure();
+    return false;
+  }
+  const auto& target = resolved->target;
+
   CaptureMetadata metadata{
       .sensor_timestamp = completion.timestamp,
   };
-  int release_fence_fd = completion.release_fence_fd;
+  int release_fence_fd = -1;
   for (const auto& output_processor : output_processors_) {
     if (output_processor == nullptr) {
       continue;
@@ -533,31 +589,37 @@ bool CameraDeviceSession::try_fill_result_from_completion_locked(
     release_fence_fd =
         output_processor
             ->process_output(OutputProcessRequest{
-                .frame_number = completion.frame_number,
-                .output_index = completion.output_index,
-                .stream_id = completion.stream_id,
-                .buffer_id = completion.buffer_id,
-                .buffer_fd = completion.buffer_fd,
-                .buffer_size = completion.buffer_size,
+                .frame_number = resolved->frame_number,
+                .output_index = resolved->output_index,
+                .stream_id = target.stream_id,
+                .buffer_id = target.buffer_id,
+                .buffer_fd = target.buffer_fd,
+                .buffer_size = target.buffer_size,
                 .input_acquire_fence_fd = release_fence_fd,
-                .width = completion.width,
-                .height = completion.height,
-                .payload_format = completion.payload_format,
+                .width = target.width,
+                .height = target.height,
+                .payload_format = payload_format_for(target.format),
             })
             .release_fence_fd;
   }
 
-  if (is_standalone_stream_completion(completion)) {
+  if (resolved->streaming_output) {
     metrics_.record_success(std::chrono::microseconds{0});
-    auto processed_completion = completion;
-    processed_completion.release_fence_fd = release_fence_fd;
-    *result = capture_result_from_standalone_completion(processed_completion);
+    *result = capture_result_from_standalone_completion(
+        *resolved->streaming_output, release_fence_fd);
+    if (stream_lease != nullptr) {
+      *stream_lease =
+          stream_buffer_lease_from_completion(*resolved->streaming_output);
+    }
+    if (completed_streaming_output != nullptr) {
+      *completed_streaming_output = *resolved->streaming_output;
+    }
     return true;
   }
 
   auto output_completion = in_flight_.complete_output(
-      completion.frame_number,
-      completion.output_index,
+      resolved->frame_number,
+      resolved->output_index,
       release_fence_fd,
       metadata);
   if (output_completion.state == OutputCompletionState::WaitingForMoreOutputs) {
@@ -571,7 +633,7 @@ bool CameraDeviceSession::try_fill_result_from_completion_locked(
   }
 
   auto converted_result = capture_result_from_output_completion(
-      output_completion, completion);
+      output_completion, target);
   if (!converted_result) {
     close_fence_fd(release_fence_fd);
     metrics_.record_failure();
@@ -594,6 +656,7 @@ void CameraDeviceSession::fill_failed_result_locked(
   }
 
   auto request = in_flight_.fail(frame_number);
+  in_flight_.clear_driver_outputs_for_frame(frame_number);
   auto completed_buffers = std::move(fallback_completed_buffers);
   auto submitted_at = fallback_submitted_at;
   if (request) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "hal/driver_adapter.h"
 #include "interface/capture_request.h"
 
 #include <chrono>
@@ -51,6 +52,24 @@ struct InFlightRequest {
       std::chrono::steady_clock::now();
 };
 
+struct InFlightStreamingOutput {
+  uint64_t frame_number = 0;
+  OutputBufferTarget target;
+  StreamType stream_type = StreamType::Preview;
+};
+
+struct DriverOutputContext {
+  uint64_t frame_number = 0;
+  int output_index = -1;
+};
+
+struct ResolvedDriverOutput {
+  uint64_t frame_number = 0;
+  int output_index = -1;
+  OutputBufferTarget target;
+  std::optional<InFlightStreamingOutput> streaming_output;
+};
+
 enum class OutputCompletionState {
   NotFound,
   WaitingForMoreOutputs,
@@ -86,6 +105,14 @@ class InFlightRequestTracker {
       int release_fence_fd = -1,
       CaptureMetadata metadata = {});
 
+  bool register_streaming_output(InFlightStreamingOutput output);
+
+  bool bind_driver_output(DriverToken token, DriverOutputContext context);
+  std::optional<ResolvedDriverOutput> take_driver_output_context(
+      DriverToken token);
+  void clear_driver_outputs_for_frame(uint64_t frame_number);
+  void clear_streaming_outputs();
+
   // Fails and removes one frame.
   std::optional<InFlightRequest> fail(uint64_t frame_number);
 
@@ -98,6 +125,13 @@ class InFlightRequestTracker {
 
  private:
   std::unordered_map<uint64_t, InFlightRequest> requests_;
+  std::unordered_map<uint64_t, InFlightStreamingOutput> streaming_outputs_;
+  std::unordered_map<uint64_t, DriverOutputContext> driver_outputs_;
+
+  std::optional<InFlightStreamingOutput> take_streaming_output(
+      uint64_t frame_number);
+  std::optional<OutputBufferTarget> output_target(uint64_t frame_number,
+                                                  int output_index) const;
 };
 
 }  // namespace minicam

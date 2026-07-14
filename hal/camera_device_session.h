@@ -128,7 +128,9 @@ class CameraDeviceSession final
       const std::vector<InFlightOutput>& in_flight_outputs);
   bool try_fill_result_from_completion_locked(
       const DriverCompletion& completion,
-      CaptureResult* result);
+      CaptureResult* result,
+      std::optional<StreamBufferLease>* stream_lease,
+      std::optional<InFlightStreamingOutput>* completed_streaming_output);
   void fill_failed_result_locked(uint64_t frame_number,
                                  CaptureStatus status,
                                  std::string message,
@@ -151,6 +153,7 @@ class CameraDeviceSession final
   StreamResultCallback stream_result_callback_;
   std::vector<std::shared_ptr<OutputProcessor>> output_processors_;
   FrameMetrics metrics_;
+  uint64_t next_streaming_frame_number_ = 1000000000000ULL;
 };
 
 }  // namespace minicam

@@ -51,16 +51,19 @@ size_t MockDriverAdapter::required_output_buffer_size(
          3U;
 }
 
-bool MockDriverAdapter::start_continuous_stream(
+std::optional<std::vector<DriverSubmission>>
+MockDriverAdapter::start_continuous_stream(
     const StreamConfig& stream,
     std::vector<DriverOutputBuffer> buffers) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!streaming_) {
     set_error("mock driver is not streaming");
-    return false;
+    return std::nullopt;
   }
 
   const size_t count = buffers.empty() ? 1 : buffers.size();
+  std::vector<DriverSubmission> submissions;
+  submissions.reserve(count);
   for (size_t i = 0; i < count; ++i) {
     const auto fallback_target = OutputBufferTarget{
         .stream_id = stream.stream_id,
@@ -71,29 +74,23 @@ bool MockDriverAdapter::start_continuous_stream(
         .format = stream.format,
     };
     const auto& target = buffers.empty() ? fallback_target : buffers[i].target;
-    const uint64_t frame_number = 1000000000000ULL + i;
+    DriverSubmission submission{
+        .token = DriverToken{.value = next_token_++},
+    };
+    submissions.push_back(submission);
     completions_.push(DriverCompletion{
-        .output_index = -1,
-        .stream_id = target.stream_id,
-        .buffer_id = target.buffer_id,
-        .frame_number = frame_number,
+        .token = submission.token,
         .bytes_used = static_cast<size_t>(target.width * target.height * 3),
         .timestamp = std::chrono::steady_clock::now(),
-        .width = target.width,
-        .height = target.height,
-        .payload_format = FramePayloadFormat::Rgb24,
-        .buffer_fd = target.buffer_fd,
-        .buffer_size = target.buffer_size,
-        .release_fence_fd = -1,
     });
 
     const uint8_t byte = 1;
     if (::write(write_fd_, &byte, sizeof(byte)) < 0 && errno != EAGAIN) {
       set_error(std::string("mock wake write failed: ") + std::strerror(errno));
-      return false;
+      return std::nullopt;
     }
   }
-  return true;
+  return submissions;
 }
 
 void MockDriverAdapter::stop_streaming() {
@@ -124,39 +121,34 @@ bool MockDriverAdapter::can_submit_capture_outputs(
   return can_submit_capture_outputs_;
 }
 
-bool MockDriverAdapter::submit_capture(DriverOutputBuffer output) {
+std::optional<DriverSubmission> MockDriverAdapter::submit_capture(
+    DriverOutputBuffer output) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!streaming_) {
     set_error("mock driver is not streaming");
-    return false;
+    return std::nullopt;
   }
   if (fail_submit_) {
     set_error("mock submit failure");
-    return false;
+    return std::nullopt;
   }
   ++submit_count_;
+  DriverSubmission submission{
+      .token = DriverToken{.value = next_token_++},
+  };
   completions_.push(DriverCompletion{
-      .output_index = output.output_index,
-      .stream_id = output.target.stream_id,
-      .buffer_id = output.buffer_id,
-      .frame_number = output.frame_number,
+      .token = submission.token,
       .bytes_used = static_cast<size_t>(output.target.width *
                                         output.target.height * 3),
       .timestamp = std::chrono::steady_clock::now(),
-      .width = output.target.width,
-      .height = output.target.height,
-      .payload_format = FramePayloadFormat::Rgb24,
-      .buffer_fd = output.target.buffer_fd,
-      .buffer_size = output.target.buffer_size,
-      .release_fence_fd = -1,
   });
 
   const uint8_t byte = 1;
   if (::write(write_fd_, &byte, sizeof(byte)) < 0 && errno != EAGAIN) {
     set_error(std::string("mock wake write failed: ") + std::strerror(errno));
-    return false;
+    return std::nullopt;
   }
-  return true;
+  return submission;
 }
 
 std::optional<DriverCompletion> MockDriverAdapter::dequeue_completion(
@@ -177,15 +169,18 @@ std::optional<DriverCompletion> MockDriverAdapter::dequeue_completion(
   return completion;
 }
 
-bool MockDriverAdapter::return_stream_buffer(StreamBufferLease lease) {
+std::optional<DriverSubmission> MockDriverAdapter::return_stream_buffer(
+    StreamBufferLease lease) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!streaming_) {
     set_error("mock driver is not streaming");
-    return false;
+    return std::nullopt;
   }
   ++returned_stream_buffer_count_;
   last_returned_stream_buffer_ = lease;
-  return true;
+  return DriverSubmission{
+      .token = DriverToken{.value = next_token_++},
+  };
 }
 
 std::vector<int> MockDriverAdapter::event_fds() const {

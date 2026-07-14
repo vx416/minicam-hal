@@ -127,7 +127,8 @@ MiniCam models HAL with:
 - `DriverAdapter`: backend abstraction for mock and V4L2 drivers
 - `OutputProcessor`: ordered asynchronous output stages such as JPEG encode
   or postprocessing, with release fd handoff
-- `InFlightRequestTracker`: frame/output bookkeeping while requests are active
+- `InFlightRequestTracker`: frame/output and driver-token bookkeeping while
+  requests or streaming buffers are active
 - `TaskExecutor`: sharded worker pool for ordered per-session async execution
 - `EpollEventLoop`: readiness notifications from V4L2 file descriptors
 
@@ -151,35 +152,9 @@ handoff to the final release fence returned to the app:
 Framework/app submits request + output buffer fds + acquire fences
   -> HAL records frame/output metadata and queues buffers to V4L2
   -> Driver fills buffers and reports completions asynchronously
-  -> HAL maps completions back to requests and runs output processors
+  -> HAL resolves driver tokens back to requests and runs output processors
   -> HAL returns CaptureResult with final release fences
   -> Framework/app waits release fences, then reads the outputs
-```
-
-Expanded step by step:
-
-```text
-1. Framework/app owns reusable DMA output buffers
-2. Framework builds CaptureRequest(frame_number, output_buffers[]), where each
-   output buffer may include an acquire_fence_fd
-3. HAL validates the request and records frame_number -> output_index -> buffer_id
-4. HAL waits each acquire_fence_fd before queueing that buffer to the driver
-5. HAL queues each buffer fd to V4L2 with VIDIOC_QBUF
-6. Driver owns the queued buffers and fills them asynchronously
-7. epoll wakes when one of the V4L2 fds has a completed buffer
-8. HAL calls VIDIOC_DQBUF and receives a low-level driver completion
-9. HAL maps the completion back to frame_number/output_index/buffer_id
-10. HAL schedules ordered output processors for each completed output
-11. Each processor receives the previous stage's release fd as its input
-    acquire fd and immediately returns a new release_fence_fd for its own
-    asynchronous work
-12. HAL collects completed outputs for that frame
-13. HAL returns CaptureResult(frame_number, completed buffers, final output
-    release fences)
-    through callback
-14. Framework/app waits each completed output's final release_fence_fd before
-    reading that output
-15. Framework/app releases reusable buffers later
 ```
 
 During that lifecycle, different layers use different request metadata fields
@@ -234,21 +209,34 @@ CaptureRequest(frame #42)
     acquire_fence_fd = 22
         |
         v
-HAL in-flight table:
-  frame #42 -> output_index 0 -> buffer_id 42
-            -> output_index 1 -> buffer_id 43
+InFlightRequestTracker after request validation:
+  requests_:
+    frame #42 -> output_index 0 -> buffer_id 42
+              -> output_index 1 -> buffer_id 43
         |
         v
 wait acquire_fence_fd 21/22
         |
         v
-V4L2 QBUF(fd=17), QBUF(fd=18)
+send outputs to DriverAdapter:
+  output_index 0: V4L2 QBUF(fd=17) -> token A
+  output_index 1: V4L2 QBUF(fd=18) -> token B
+        |
+        v
+InFlightRequestTracker after driver submission:
+  driver_outputs_:
+    token A -> frame #42, output_index 0
+    token B -> frame #42, output_index 1
         |
         v
 epoll -> DQBUF
         |
         v
-DriverCompletion(frame #42, output_index 0, buffer_id 42)
+DriverCompletion(token A)
+        |
+        v
+InFlightRequestTracker resolves token A -> frame #42, output_index 0,
+then restores buffer_id 42 from requests_
         |
         v
 OutputProcessor waits input acquire fd and returns release_fence_fd
@@ -263,11 +251,47 @@ CaptureResult(frame #42,
 Example preview flow:
 
 ```text
-HAL pre-queues preview buffers
-  -> V4L2 continuously produces frames
-  -> each DQBUF dispatches a preview result
-  -> callback reads the preview buffer
-  -> HAL returns the same buffer with QBUF
+Preview buffer #901:
+  buffer_fd = 31
+  acquire_fence_fd = 41
+        |
+        v
+InFlightRequestTracker before queueing:
+  streaming_outputs_:
+    frame #1000000000000 -> buffer_id 901
+        |
+        v
+wait acquire_fence_fd 41
+        |
+        v
+send preview buffer to DriverAdapter:
+  V4L2 QBUF(fd=31) -> token P
+        |
+        v
+InFlightRequestTracker after driver submission:
+  driver_outputs_:
+    token P -> frame #1000000000000, output_index -1
+        |
+        v
+epoll -> DQBUF -> DriverCompletion(token P)
+        |
+        v
+InFlightRequestTracker resolves token P -> streaming output buffer #901
+        |
+        v
+HAL dispatches preview result with release_fence_fd
+        |
+        v
+callback waits/consumes release_fence_fd and reads buffer #901
+        |
+        v
+callback returns StreamBufferLease with consumer_release_fence_fd
+        |
+        v
+HAL waits consumer_release_fence_fd before re-queueing buffer #901
+        |
+        v
+V4L2 QBUF(fd=31) again -> new token
 ```
 
 The preview buffer is returned to V4L2 only after the callback finishes reading
@@ -346,8 +370,11 @@ buffer ownership transfer, while callbacks carry metadata and buffer ids.
 - `V4L2MultiStreamDriverAdapter` routes preview and still streams to different
   V4L2 capture fds
 
-The session talks to the adapter in terms of output buffers and completions. It
-does not know whether the backend is mock or V4L2.
+The session talks to the adapter in terms of output buffers, opaque submission
+tokens, and completions that carry those tokens. It does not know whether the
+backend is mock or V4L2. The adapter may need backend-specific state, such as a
+V4L2 queue-slot table, but it does not expose frame numbers, output indexes, or
+framework buffer ids in its completion API.
 
 ### V4L2 Backend
 
@@ -370,11 +397,13 @@ The runtime path is an in-queue / out-queue loop:
 ```text
 HAL has buffer_fd for the leased dma-buf
   -> VIDIOC_QBUF         enqueue buffer_fd into a driver queue slot
+  -> adapter records     V4L2 queue slot -> opaque driver token
   -> VIDIOC_STREAMON     start device streaming after buffers are queued
   -> driver / ISP fills queued buffers asynchronously
   -> epoll readiness     fd becomes readable when a buffer completes
   -> VIDIOC_DQBUF        dequeue one completed buffer
-  -> HAL restores frame_number/output_index/buffer_id context
+  -> adapter restores    V4L2 queue slot -> opaque driver token
+  -> HAL tracker resolves token -> frame/output or streaming-buffer context
   -> HAL returns CaptureResult through callback
 ```
 

@@ -74,8 +74,11 @@ void close_fence(int fence_fd) {
 }  // namespace
 #endif
 
-V4L2DriverAdapter::V4L2DriverAdapter(V4L2StreamConfig config)
-    : config_(std::move(config)) {}
+V4L2DriverAdapter::V4L2DriverAdapter(
+    V4L2StreamConfig config,
+    std::function<DriverToken()> token_generator)
+    : config_(std::move(config)),
+      token_generator_(std::move(token_generator)) {}
 
 V4L2DriverAdapter::~V4L2DriverAdapter() {
   close();
@@ -152,10 +155,7 @@ bool V4L2DriverAdapter::configure_stream() {
   for (__u32 i = 0; i < request_buffers.count; ++i) {
     queued_requests_.push_back(V4L2QueuedRequest{
         .index = static_cast<int>(i),
-        .frame_number = 0,
-        .output_index = -1,
-        .stream_id = 0,
-        .buffer_id = -1,
+        .token = {},
         .buffer_fd = -1,
         .acquire_fence_fd = -1,
         .buffer_size = 0,
@@ -185,35 +185,36 @@ size_t V4L2DriverAdapter::required_output_buffer_size(
   return buffer_size_;
 }
 
-bool V4L2DriverAdapter::start_continuous_stream(
+std::optional<std::vector<DriverSubmission>>
+V4L2DriverAdapter::start_continuous_stream(
     const StreamConfig& stream,
     std::vector<DriverOutputBuffer> buffers) {
 #ifdef __linux__
   (void)stream;
   if (!streaming_ || fd_ < 0) {
     set_error("V4L2 stream is not started");
-    return false;
+    return std::nullopt;
   }
 
   continuous_streaming_ = true;
+  std::vector<DriverSubmission> submissions;
+  submissions.reserve(buffers.size());
   for (auto& buffer : buffers) {
-    if (!queue_capture_buffer(next_continuous_frame_number_++,
-                              buffer.target.stream_id,
-                              buffer.buffer_id,
-                              /*output_index=*/-1,
-                              buffer.target.buffer_fd,
-                              buffer.target.acquire_fence_fd,
-                              buffer.target.buffer_size)) {
+    auto submission = queue_capture_buffer(buffer.target.buffer_fd,
+                                           buffer.target.acquire_fence_fd,
+                                           buffer.target.buffer_size);
+    if (!submission) {
       continuous_streaming_ = false;
-      return false;
+      return std::nullopt;
     }
+    submissions.push_back(*submission);
   }
-  return true;
+  return submissions;
 #else
   (void)stream;
   (void)buffers;
   set_error("V4L2 is only available on Linux");
-  return false;
+  return std::nullopt;
 #endif
 }
 
@@ -246,20 +247,16 @@ void V4L2DriverAdapter::close() {
   streaming_ = false;
 }
 
-bool V4L2DriverAdapter::submit_capture(DriverOutputBuffer output) {
+std::optional<DriverSubmission> V4L2DriverAdapter::submit_capture(
+    DriverOutputBuffer output) {
 #ifdef __linux__
-  return queue_capture_buffer(
-      output.frame_number,
-      output.target.stream_id,
-      output.buffer_id,
-      output.output_index,
-      output.target.buffer_fd,
-      output.target.acquire_fence_fd,
-      output.target.buffer_size);
+  return queue_capture_buffer(output.target.buffer_fd,
+                              output.target.acquire_fence_fd,
+                              output.target.buffer_size);
 #else
   (void)output;
   set_error("V4L2 is only available on Linux");
-  return false;
+  return std::nullopt;
 #endif
 }
 
@@ -276,45 +273,45 @@ bool V4L2DriverAdapter::can_submit_capture_outputs(
   return true;
 }
 
-bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
-                                             int stream_id,
-                                             int buffer_id,
-                                             int output_index,
-                                             int buffer_fd,
-                                             int acquire_fence_fd,
-                                             size_t dma_buf_size) {
+std::optional<DriverSubmission> V4L2DriverAdapter::queue_capture_buffer(
+    int buffer_fd,
+    int acquire_fence_fd,
+    size_t dma_buf_size) {
 #ifdef __linux__
   if (!streaming_ || fd_ < 0) {
     set_error("V4L2 stream is not started");
-    return false;
+    return std::nullopt;
   }
   if (buffer_fd < 0) {
     set_error("V4L2 capture requires a valid dma-buf from the request");
-    return false;
+    return std::nullopt;
   }
   if (dma_buf_size < buffer_size_) {
     set_error("request dma-buf is smaller than the configured V4L2 frame");
-    return false;
+    return std::nullopt;
   }
   if (!wait_for_fence(acquire_fence_fd)) {
     close_fence(acquire_fence_fd);
     set_error(std::string("acquire fence wait failed: ") +
               std::strerror(errno));
-    return false;
+    return std::nullopt;
   }
   close_fence(acquire_fence_fd);
   acquire_fence_fd = -1;
 
+  DriverSubmission submission{
+      .token = next_token(),
+  };
   auto* queued_request =
-      bind_free_queued_request(frame_number, stream_id, buffer_id, output_index,
-                               buffer_fd, acquire_fence_fd, dma_buf_size);
+      bind_free_queued_request(submission.token, buffer_fd, acquire_fence_fd,
+                               dma_buf_size);
   if (queued_request == nullptr) {
     set_error("V4L2 queue is full");
-    return false;
+    return std::nullopt;
   }
   if (queued_request->buffer_fd < 0) {
     set_error("V4L2 queued request binding failed");
-    return false;
+    return std::nullopt;
   }
 
   v4l2_buffer buffer{};
@@ -325,7 +322,7 @@ bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
   if (xioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
     clear_queued_request(buffer.index);
     set_error(std::string("VIDIOC_QBUF failed: ") + std::strerror(errno));
-    return false;
+    return std::nullopt;
   }
 
   if (!device_streaming_) {
@@ -334,22 +331,18 @@ bool V4L2DriverAdapter::queue_capture_buffer(uint64_t frame_number,
       clear_queued_request(buffer.index);
       set_error(std::string("VIDIOC_STREAMON failed: ") +
                 std::strerror(errno));
-      return false;
+      return std::nullopt;
     }
     device_streaming_ = true;
   }
 
-  return true;
+  return submission;
 #else
-  (void)frame_number;
-  (void)stream_id;
-  (void)buffer_id;
-  (void)output_index;
   (void)buffer_fd;
   (void)acquire_fence_fd;
   (void)dma_buf_size;
   set_error("V4L2 is only available on Linux");
-  return false;
+  return std::nullopt;
 #endif
 }
 
@@ -397,22 +390,19 @@ std::optional<DriverCompletion> V4L2DriverAdapter::dequeue_completion(
 #endif
 }
 
-bool V4L2DriverAdapter::return_stream_buffer(StreamBufferLease lease) {
+std::optional<DriverSubmission> V4L2DriverAdapter::return_stream_buffer(
+    StreamBufferLease lease) {
 #ifdef __linux__
   if (!continuous_streaming_) {
-    return true;
+    return DriverSubmission{};
   }
-  return queue_capture_buffer(next_continuous_frame_number_++,
-                              lease.stream_id,
-                              lease.buffer_id,
-                              /*output_index=*/-1,
-                              lease.buffer_fd,
+  return queue_capture_buffer(lease.buffer_fd,
                               lease.consumer_release_fence_fd,
                               lease.buffer_size);
 #else
   (void)lease;
   set_error("V4L2 is only available on Linux");
-  return false;
+  return std::nullopt;
 #endif
 }
 
@@ -450,10 +440,7 @@ size_t V4L2DriverAdapter::free_queued_request_count() const {
 }
 
 V4L2DriverAdapter::V4L2QueuedRequest*
-V4L2DriverAdapter::bind_free_queued_request(uint64_t frame_number,
-                                            int stream_id,
-                                            int buffer_id,
-                                            int output_index,
+V4L2DriverAdapter::bind_free_queued_request(DriverToken token,
                                             int buffer_fd,
                                             int acquire_fence_fd,
                                             size_t buffer_size) {
@@ -462,10 +449,7 @@ V4L2DriverAdapter::bind_free_queued_request(uint64_t frame_number,
       continue;
     }
     queued_request.queued = true;
-    queued_request.frame_number = frame_number;
-    queued_request.stream_id = stream_id;
-    queued_request.buffer_id = buffer_id;
-    queued_request.output_index = output_index;
+    queued_request.token = token;
     queued_request.buffer_fd = buffer_fd;
     queued_request.acquire_fence_fd = acquire_fence_fd;
     queued_request.buffer_size = buffer_size;
@@ -480,10 +464,7 @@ void V4L2DriverAdapter::clear_queued_request(uint32_t index) {
     return;
   }
   queued_request->queued = false;
-  queued_request->frame_number = 0;
-  queued_request->output_index = -1;
-  queued_request->stream_id = 0;
-  queued_request->buffer_id = -1;
+  queued_request->token = {};
   queued_request->buffer_fd = -1;
   queued_request->acquire_fence_fd = -1;
   queued_request->buffer_size = 0;
@@ -492,14 +473,22 @@ void V4L2DriverAdapter::clear_queued_request(uint32_t index) {
 void V4L2DriverAdapter::reset_queued_requests() {
   for (auto& queued_request : queued_requests_) {
     queued_request.queued = false;
-    queued_request.frame_number = 0;
-    queued_request.output_index = -1;
-    queued_request.stream_id = 0;
-    queued_request.buffer_id = -1;
+    queued_request.token = {};
     queued_request.buffer_fd = -1;
     queued_request.acquire_fence_fd = -1;
     queued_request.buffer_size = 0;
   }
+}
+
+DriverToken V4L2DriverAdapter::next_token() {
+  if (token_generator_) {
+    return token_generator_();
+  }
+#ifdef __linux__
+  return DriverToken{.value = next_token_++};
+#else
+  return DriverToken{};
+#endif
 }
 
 DriverCompletion V4L2DriverAdapter::convert_queued_request_to_completion(
@@ -507,18 +496,9 @@ DriverCompletion V4L2DriverAdapter::convert_queued_request_to_completion(
     size_t bytes_used,
     std::chrono::steady_clock::time_point timestamp) const {
   return DriverCompletion{
-      .output_index = queued_request.output_index,
-      .stream_id = queued_request.stream_id,
-      .buffer_id = queued_request.buffer_id,
-      .frame_number = queued_request.frame_number,
+      .token = queued_request.token,
       .bytes_used = bytes_used,
       .timestamp = timestamp,
-      .width = config_.width,
-      .height = config_.height,
-      .payload_format = FramePayloadFormat::Yuyv422,
-      .buffer_fd = queued_request.buffer_fd,
-      .buffer_size = queued_request.buffer_size,
-      .release_fence_fd = -1,
   };
 }
 
@@ -533,7 +513,8 @@ V4L2MultiStreamDriverAdapter::V4L2MultiStreamDriverAdapter(
     endpoints_.push_back(Endpoint{
         .stream_type = endpoint.stream_type,
         .adapter = std::make_unique<V4L2DriverAdapter>(
-            std::move(endpoint.stream)),
+            std::move(endpoint.stream),
+            [this] { return DriverToken{.value = next_token_++}; }),
     });
   }
 }
@@ -577,20 +558,23 @@ size_t V4L2MultiStreamDriverAdapter::required_output_buffer_size(
   return endpoint->adapter->required_output_buffer_size(output);
 }
 
-bool V4L2MultiStreamDriverAdapter::start_continuous_stream(
+std::optional<std::vector<DriverSubmission>>
+V4L2MultiStreamDriverAdapter::start_continuous_stream(
     const StreamConfig& stream,
     std::vector<DriverOutputBuffer> buffers) {
   auto* endpoint = endpoint_for(stream.stream_type);
   if (endpoint == nullptr) {
     set_error("no V4L2 endpoint for continuous stream type");
-    return false;
+    return std::nullopt;
   }
 
-  if (!endpoint->adapter->start_continuous_stream(stream, std::move(buffers))) {
+  auto submissions =
+      endpoint->adapter->start_continuous_stream(stream, std::move(buffers));
+  if (!submissions) {
     set_error(endpoint->adapter->last_error());
-    return false;
+    return std::nullopt;
   }
-  return true;
+  return submissions;
 }
 
 void V4L2MultiStreamDriverAdapter::stop_streaming() {
@@ -625,18 +609,20 @@ bool V4L2MultiStreamDriverAdapter::can_submit_capture_outputs(
   return true;
 }
 
-bool V4L2MultiStreamDriverAdapter::submit_capture(DriverOutputBuffer output) {
+std::optional<DriverSubmission> V4L2MultiStreamDriverAdapter::submit_capture(
+    DriverOutputBuffer output) {
   auto* endpoint = endpoint_for(output.target.stream_type);
   if (endpoint == nullptr) {
     set_error("no V4L2 endpoint for requested stream type");
-    return false;
+    return std::nullopt;
   }
 
-  if (!endpoint->adapter->submit_capture(std::move(output))) {
+  auto submission = endpoint->adapter->submit_capture(std::move(output));
+  if (!submission) {
     set_error(endpoint->adapter->last_error());
-    return false;
+    return std::nullopt;
   }
-  return true;
+  return submission;
 }
 
 std::optional<DriverCompletion> V4L2MultiStreamDriverAdapter::
@@ -653,19 +639,20 @@ std::optional<DriverCompletion> V4L2MultiStreamDriverAdapter::
   return completion;
 }
 
-bool V4L2MultiStreamDriverAdapter::return_stream_buffer(
-    StreamBufferLease lease) {
+std::optional<DriverSubmission>
+V4L2MultiStreamDriverAdapter::return_stream_buffer(StreamBufferLease lease) {
   auto* endpoint = endpoint_for(lease.stream_type);
   if (endpoint == nullptr) {
     set_error("no V4L2 endpoint for continuous stream type");
-    return false;
+    return std::nullopt;
   }
 
-  if (!endpoint->adapter->return_stream_buffer(std::move(lease))) {
+  auto submission = endpoint->adapter->return_stream_buffer(std::move(lease));
+  if (!submission) {
     set_error(endpoint->adapter->last_error());
-    return false;
+    return std::nullopt;
   }
-  return true;
+  return submission;
 }
 
 std::vector<int> V4L2MultiStreamDriverAdapter::event_fds() const {

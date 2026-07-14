@@ -24,16 +24,19 @@ class MockDriverAdapter final : public DriverAdapter {
   bool start_streaming() override;
   size_t required_output_buffer_size(
       const OutputBufferTarget& output) const override;
-  bool start_continuous_stream(const StreamConfig& stream,
-                               std::vector<DriverOutputBuffer> buffers) override;
+  std::optional<std::vector<DriverSubmission>> start_continuous_stream(
+      const StreamConfig& stream,
+      std::vector<DriverOutputBuffer> buffers) override;
   void stop_streaming() override;
   void close() override;
 
   bool can_submit_capture_outputs(
       const std::vector<OutputBufferTarget>& outputs) const override;
-  bool submit_capture(DriverOutputBuffer output) override;
+  std::optional<DriverSubmission> submit_capture(
+      DriverOutputBuffer output) override;
   std::optional<DriverCompletion> dequeue_completion(int ready_fd) override;
-  bool return_stream_buffer(StreamBufferLease lease) override;
+  std::optional<DriverSubmission> return_stream_buffer(
+      StreamBufferLease lease) override;
 
   std::vector<int> event_fds() const override;
   const std::string& last_error() const override;
@@ -60,6 +63,7 @@ class MockDriverAdapter final : public DriverAdapter {
   size_t submit_count_ = 0;
   size_t returned_stream_buffer_count_ = 0;
   std::optional<StreamBufferLease> last_returned_stream_buffer_;
+  uint64_t next_token_ = 1;
 };
 
 }  // namespace minicam

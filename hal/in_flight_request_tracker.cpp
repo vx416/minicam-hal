@@ -93,6 +93,100 @@ OutputCompletionResult InFlightRequestTracker::complete_output(
   };
 }
 
+bool InFlightRequestTracker::register_streaming_output(
+    InFlightStreamingOutput output) {
+  if (streaming_outputs_.contains(output.frame_number)) {
+    return false;
+  }
+  streaming_outputs_.emplace(output.frame_number, std::move(output));
+  return true;
+}
+
+std::optional<InFlightStreamingOutput> InFlightRequestTracker::take_streaming_output(
+    uint64_t frame_number) {
+  auto it = streaming_outputs_.find(frame_number);
+  if (it == streaming_outputs_.end()) {
+    return std::nullopt;
+  }
+  auto output = it->second;
+  streaming_outputs_.erase(it);
+  return output;
+}
+
+bool InFlightRequestTracker::bind_driver_output(
+    DriverToken token,
+    DriverOutputContext context) {
+  if (token.value == 0 || driver_outputs_.contains(token.value)) {
+    return false;
+  }
+  driver_outputs_.emplace(token.value, context);
+  return true;
+}
+
+std::optional<ResolvedDriverOutput>
+InFlightRequestTracker::take_driver_output_context(DriverToken token) {
+  auto it = driver_outputs_.find(token.value);
+  if (it == driver_outputs_.end()) {
+    return std::nullopt;
+  }
+  auto context = it->second;
+  driver_outputs_.erase(it);
+
+  if (context.output_index < 0) {
+    auto streaming_output = take_streaming_output(context.frame_number);
+    if (!streaming_output) {
+      return std::nullopt;
+    }
+    return ResolvedDriverOutput{
+        .frame_number = context.frame_number,
+        .output_index = context.output_index,
+        .target = streaming_output->target,
+        .streaming_output = *streaming_output,
+    };
+  }
+
+  auto target = output_target(context.frame_number, context.output_index);
+  if (!target) {
+    return std::nullopt;
+  }
+  return ResolvedDriverOutput{
+      .frame_number = context.frame_number,
+      .output_index = context.output_index,
+      .target = *target,
+      .streaming_output = std::nullopt,
+  };
+}
+
+void InFlightRequestTracker::clear_driver_outputs_for_frame(
+    uint64_t frame_number) {
+  for (auto it = driver_outputs_.begin(); it != driver_outputs_.end();) {
+    if (it->second.frame_number == frame_number) {
+      it = driver_outputs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void InFlightRequestTracker::clear_streaming_outputs() {
+  streaming_outputs_.clear();
+}
+
+std::optional<OutputBufferTarget> InFlightRequestTracker::output_target(
+    uint64_t frame_number,
+    int output_index) const {
+  const auto it = requests_.find(frame_number);
+  if (it == requests_.end()) {
+    return std::nullopt;
+  }
+  for (const auto& output : it->second.output_buffers) {
+    if (output.output_index == output_index) {
+      return output.target;
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<InFlightRequest> InFlightRequestTracker::fail(
     uint64_t frame_number) {
   auto it = requests_.find(frame_number);
@@ -115,6 +209,7 @@ std::vector<InFlightRequest> InFlightRequestTracker::flush_all() {
     flushed.push_back(request);
   }
   requests_.clear();
+  driver_outputs_.clear();
   return flushed;
 }
 
