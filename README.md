@@ -189,6 +189,13 @@ frame_number
       An fd returned in CompletedOutputBuffer. The app waits this before
       reading the processor output. MiniCam's processor fences are pollable
       pipe-backed async fds, not hardware dma_fence/sync_file fds.
+
+    driver_token
+      Opaque id returned by DriverAdapter after the output buffer is submitted
+      to the backend. It is not a framework request id. MiniCam stores
+      driver_outputs_[driver_token] -> frame_number + output_index so a later
+      DriverCompletion(driver_token) can be resolved back to the original
+      OutputBufferTarget.
 ```
 
 Example still capture flow:
